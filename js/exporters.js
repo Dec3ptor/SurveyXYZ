@@ -33,9 +33,12 @@ export function photoName(obs, i) {
 }
 
 export const OBS_COLS = ['number', 'time_utc', 'time_local', 'latitude', 'longitude', 'accuracy_m', 'category', 'note', 'reading', 'unit', 'extent_m', 'photos'];
+export const notesOnly = (obs) => obs.filter((o) => o.kind !== 'sample');
+export const samplesOnly = (obs) => obs.filter((o) => o.kind === 'sample');
+
 export function obsCSV(obs) {
   const rows = [OBS_COLS];
-  for (const o of obs) {
+  for (const o of notesOnly(obs)) {
     rows.push([o.num, iso(o.t), localStamp(o.t), f7(o.lat), f7(o.lon), f1(o.acc), o.category || '', o.note || '',
       o.reading ?? '', o.unit || '', o.extent ?? '', (o.photoIds || []).map((_, i) => photoName(o, i)).join(';')]);
   }
@@ -82,7 +85,7 @@ export function trackPointsGeoJSON(points) {
 }
 
 export function obsGeoJSON(obs) {
-  return fc('observations', obs.map((o) => ({
+  return fc('observations', notesOnly(obs).map((o) => ({
     type: 'Feature',
     geometry: { type: 'Point', coordinates: [f7(o.lon), f7(o.lat)] },
     properties: {
@@ -109,7 +112,42 @@ export function planGeoJSON(survey) {
       properties: { kind: 'planned_route', survey: survey.name, spacing_m: plan.spacing ?? null, bearing_deg: plan.bearing ?? null, length_m: Math.round(pathLength(plan.route)) },
     });
   }
+  for (const pt of plan.points || []) {
+    feats.push({
+      type: 'Feature', geometry: { type: 'Point', coordinates: [f7(pt.lon), f7(pt.lat)] },
+      properties: { kind: 'sample_point', id: pt.id, point_type: pt.kind, status: pt.status, reason: pt.why || '', survey: survey.name },
+    });
+  }
   return fc('plan', feats);
+}
+
+const list = (v) => (Array.isArray(v) ? v.join('; ') : v ?? '');
+export const SAMPLE_COLS = ['sample_id', 'location_id', 'sample_type', 'date_local', 'time_local', 'time_utc', 'depth_from_m', 'depth_to_m',
+  'latitude', 'longitude', 'gps_accuracy_m', 'planned_latitude', 'planned_longitude', 'offset_from_planned_m',
+  'method', 'material', 'soil_type', 'colour', 'moisture', 'odour', 'evidence', 'pid_ppm', 'analytes', 'containers', 'sampler', 'weather', 'notes', 'photos'];
+
+function sampleRow(survey, o) {
+  const d = o.data || {};
+  const pt = (survey.plan?.points || []).find((p) => p.id === o.pointId);
+  const plat = pt?.plat ?? pt?.lat, plon = pt?.plon ?? pt?.lon;
+  const R = 6371008.8, r = Math.PI / 180;
+  const off = pt ? Math.hypot((o.lat - plat) * r * R, (o.lon - plon) * r * R * Math.cos(o.lat * r)) : null;
+  const ls = localStamp(o.t);
+  return [d.sampleId || '', o.pointId || '', d.type || '', ls.slice(0, 10), ls.slice(11), iso(o.t), d.depthFrom ?? '', d.depthTo ?? '',
+    f7(o.lat), f7(o.lon), f1(o.acc), pt ? f7(plat) : '', pt ? f7(plon) : '', pt ? f1(off) : '',
+    d.method || '', d.stratum || '', list(d.soil), d.colour || '', d.moisture || '', d.odour || '', list(d.evidence), d.pid ?? '',
+    list(d.analytes), d.containers || '', d.sampler || '', d.weather || '', o.note || '', (o.photoIds || []).map((_, i) => photoName(o, i)).join(';')];
+}
+export function samplesCSV(survey, obs) {
+  return toCSV([SAMPLE_COLS, ...samplesOnly(obs).map((o) => sampleRow(survey, o))]);
+}
+export function samplesGeoJSON(survey, obs) {
+  return fc('samples', samplesOnly(obs).map((o) => {
+    const row = sampleRow(survey, o), props = {};
+    SAMPLE_COLS.forEach((c, i) => { props[c] = row[i] === '' ? null : row[i]; });
+    props.photo = (o.photoIds || []).length ? photoName(o, 0) : '';
+    return { type: 'Feature', geometry: { type: 'Point', coordinates: [f7(o.lon), f7(o.lat)] }, properties: props };
+  }));
 }
 
 /** Everything in one GeoJSON file (mixed geometry; QGIS splits it into layers on load). */
@@ -119,6 +157,7 @@ export function allGeoJSON(survey, points, obs) {
     ...tag(planGeoJSON(survey), 'plan'),
     ...tag(trackLineGeoJSON(survey, points), 'track'),
     ...tag(obsGeoJSON(obs), 'observation'),
+    ...tag(samplesGeoJSON(survey, obs), 'sample'),
   ]);
 }
 
@@ -127,7 +166,7 @@ export function gpx(survey, points, obs) {
     '<gpx version="1.1" creator="SurveyXYZ" xmlns="http://www.topografix.com/GPX/1/1">',
     `<metadata><name>${xml(survey.name)}</name><time>${iso(survey.created)}</time></metadata>`];
   for (const o of obs) {
-    out.push(`<wpt lat="${f7(o.lat)}" lon="${f7(o.lon)}"><time>${iso(o.t)}</time><name>${xml(`${o.num} ${o.category || ''}`.trim())}</name>` +
+    out.push(`<wpt lat="${f7(o.lat)}" lon="${f7(o.lon)}"><time>${iso(o.t)}</time><name>${xml(o.kind === 'sample' ? o.data?.sampleId || o.pointId || 'sample' : `${o.num} ${o.category || ''}`.trim())}</name>` +
       `<desc>${xml([o.note, o.reading != null && o.reading !== '' ? `${o.reading} ${o.unit || ''}` : ''].filter(Boolean).join(' | '))}</desc></wpt>`);
   }
   if (survey.plan?.route?.length >= 2) {
@@ -164,9 +203,12 @@ track.csv              one row per GPS fix (${points.length} rows). latitude/lon
                        dr = dead-reckoned from steps + compass while GPS was absent.
 track_line.geojson     the walked path as a line (one part per recording segment)
 track_points.geojson   every fix as a point with attributes
-observations.geojson   notes / marks / manual readings (${obs.length}); 'photo' is a relative path
+observations.geojson   notes / marks / manual readings (${notesOnly(obs).length}); 'photo' is a relative path
 observations.csv       same, as a table
-plan.geojson           site boundary and planned route
+samples.csv            sample register (${samplesOnly(obs).length}): ID, location, depth, type, soil description,
+                       analysis requested, actual and planned coordinates
+samples.geojson        same, as points
+plan.geojson           site boundary, planned route and planned sampling points (with status)
 track.gpx              track + waypoints + planned route for GPS tools / Google Earth
 survey.json            full backup; re-import in SurveyXYZ (Menu > Surveys > Import backup)
 photos/                observation photos, named obsNNN_n.jpg
@@ -181,12 +223,13 @@ widget type Attachment, relative path, integrated viewer: Image.
 // ---- plan import (GeoJSON / GPX / KML) ----
 
 function fromGeoJSON(obj) {
-  const res = { boundary: null, route: null };
-  const visit = (g) => {
+  const res = { boundary: null, route: null, points: [] };
+  const visit = (g, props) => {
     if (!g) return;
     if (g.type === 'FeatureCollection') g.features.forEach((f) => visit(f));
-    else if (g.type === 'Feature') visit(g.geometry);
+    else if (g.type === 'Feature') visit(g.geometry, g.properties);
     else if (g.type === 'GeometryCollection') g.geometries.forEach(visit);
+    else if (g.type === 'Point') res.points.push({ lat: g.coordinates[1], lon: g.coordinates[0], id: props?.id ?? props?.name ?? props?.Name ?? null });
     else if (g.type === 'Polygon' && !res.boundary) res.boundary = g.coordinates[0];
     else if (g.type === 'MultiPolygon' && !res.boundary) res.boundary = g.coordinates[0][0];
     else if (g.type === 'LineString' && !res.route) res.route = g.coordinates;
@@ -214,17 +257,27 @@ export function parsePlanFile(text) {
     }).filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
     let pts = grab('rtept');
     if (pts.length < 2) pts = grab('trkpt');
-    res = { boundary: null, route: pts };
+    const wpts = [...t.matchAll(/<wpt\b([^>]*)>([\s\S]*?)<\/wpt>/gi)].map((m) => ({
+      lat: +(m[1].match(/lat\s*=\s*["']([^"']+)/i) || [])[1], lon: +(m[1].match(/lon\s*=\s*["']([^"']+)/i) || [])[1],
+      id: (m[2].match(/<name>([^<]*)<\/name>/i) || [])[1] || null,
+    }));
+    res = { boundary: null, route: pts, points: wpts };
   } else if (/<kml[\s>]/i.test(t)) {
     const poly = t.match(/<Polygon[\s\S]*?<coordinates>([\s\S]*?)<\/coordinates>/i);
     const line = t.match(/<LineString[\s\S]*?<coordinates>([\s\S]*?)<\/coordinates>/i);
-    res = { boundary: poly ? kmlCoords(poly[1]) : null, route: line ? kmlCoords(line[1]) : null };
+    const pms = [...t.matchAll(/<Placemark[\s\S]*?<\/Placemark>/gi)].map((m) => m[0]).filter((m) => /<Point[\s>]/i.test(m));
+    const points = pms.map((m) => {
+      const c = kmlCoords((m.match(/<Point[\s\S]*?<coordinates>([\s\S]*?)<\/coordinates>/i) || [])[1] || '')[0];
+      return c ? { lat: c[0], lon: c[1], id: (m.match(/<name>([^<]*)<\/name>/i) || [])[1] || null } : null;
+    }).filter(Boolean);
+    res = { boundary: poly ? kmlCoords(poly[1]) : null, route: line ? kmlCoords(line[1]) : null, points };
   } else throw new Error('Unrecognised file: expected GeoJSON, GPX or KML');
   // Closed rings repeat the first vertex; we store them open.
   const b = res.boundary;
   if (b && b.length > 1 && b[0][0] === b[b.length - 1][0] && b[0][1] === b[b.length - 1][1]) b.pop();
   if (b && b.length < 3) res.boundary = null;
   if (res.route && res.route.length < 2) res.route = null;
-  if (!res.boundary && !res.route) throw new Error('No polygon or line found in file');
+  res.points = (res.points || []).filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon));
+  if (!res.boundary && !res.route && !res.points.length) throw new Error('No polygon, line or points found in file');
   return res;
 }

@@ -2,10 +2,12 @@
 import * as db from './db.js';
 import { FusionFilter } from './fusion.js';
 import { Sensors } from './sensors.js';
-import { haversine, bearing, angDiff, cardinal, frameFor, RouteFollower, generateTransects, longestEdgeBearing, polygonArea, pathLength, Coverage } from './geo.js';
+import { haversine, bearing, angDiff, cardinal, frameFor, RouteFollower, generateTransects, samplePoints, longestEdgeBearing, polygonArea, pathLength, Coverage } from './geo.js';
 import * as ex from './exporters.js';
 import { makeZip } from './zip.js';
 import { openMerge } from './mergeui.js';
+import { MODES, PATTERNS, hotspotDiameter, DEFAULT_ANALYTES } from './modes.js';
+import { openSample, startSample, openPoint, openPointList, openSamplesList } from './sampling.js';
 
 const $ = (id) => document.getElementById(id);
 export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -13,10 +15,12 @@ export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&a
 // ---------- settings ----------
 const DEFAULTS = {
   filterMode: 'smart', maxAcc: 25, tol: 3, spacing: 10, sound: true, vibrate: true, showRaw: false,
-  categories: 'Exceedance, Crack / fissure, Vegetation stress, Odour, Leachate, Erosion, Well / borehole, Cover damage, Other',
-  unit: 'ppm', base: 'Satellite',
+  base: 'Satellite', arrive: 3, analytes: DEFAULT_ANALYTES, mode: 'ism',
 };
 export const settings = { ...DEFAULTS, ...JSON.parse(localStorage.getItem('sxyz.settings') || '{}') };
+export const mode = () => MODES[S.survey?.mode] || MODES.ism;
+export const noteCategories = () => (settings['cats_' + S.survey.mode] ?? mode().categories).split(',').map((c) => c.trim()).filter(Boolean);
+export const noteUnit = () => settings['unit_' + S.survey.mode] ?? mode().unit;
 const saveSettings = () => localStorage.setItem('sxyz.settings', JSON.stringify(settings));
 
 // ---------- state ----------
@@ -43,9 +47,12 @@ L.control.layers(bases, null, { position: 'bottomleft' }).addTo(map);
 L.control.scale({ imperial: false, position: 'bottomleft' }).addTo(map);
 map.on('baselayerchange', (e) => { settings.base = e.name; saveSettings(); });
 map.on('dragstart', () => setFollow(false));
+// Point labels crowd the map when zoomed out; show only the target's label then.
+const zoomClass = () => $('map').classList.toggle('lowzoom', map.getZoom() < 19);
+map.on('zoomend', zoomClass); zoomClass();
 
 const layers = {
-  plan: L.layerGroup().addTo(map), covered: L.layerGroup().addTo(map), raw: L.layerGroup().addTo(map),
+  plan: L.layerGroup().addTo(map), points: L.layerGroup().addTo(map), covered: L.layerGroup().addTo(map), raw: L.layerGroup().addTo(map),
   track: L.layerGroup().addTo(map), readings: L.layerGroup().addTo(map), obs: L.layerGroup().addTo(map),
   edit: L.layerGroup().addTo(map), me: L.layerGroup().addTo(map),
 };
@@ -67,11 +74,15 @@ let sheetOnClose = null;
 export function openSheet(title, html, onClose) {
   closeSheet();
   $('sheetTitle').textContent = title;
-  $('sheetBody').innerHTML = html;
+  // A fresh inner element per sheet: handlers a sheet attaches cannot be hit by
+  // the tap that opened it, or linger into the next sheet.
+  const inner = document.createElement('div');
+  inner.innerHTML = html;
+  $('sheetBody').replaceChildren(inner);
   $('sheetBody').scrollTop = 0;
   $('sheet').hidden = false;
   sheetOnClose = onClose || null;
-  return $('sheetBody');
+  return inner;
 }
 export function closeSheet() {
   if ($('sheet').hidden) return;
@@ -118,23 +129,26 @@ function beep() {
     o.start(); o.stop(beep.ctx.currentTime + 0.18);
   } catch { /* no audio */ }
 }
-const fmtDist = (m) => (m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m');
+export const fmtDist = (m) => (m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m');
 const fmtDur = (ms) => {
   const s = Math.floor(ms / 1000), p = (n) => String(n).padStart(2, '0');
   return `${Math.floor(s / 3600)}:${p(Math.floor(s / 60) % 60)}:${p(s % 60)}`;
 };
 
 // ---------- surveys ----------
-async function newSurvey(name, copyPlanFrom) {
+async function newSurvey(name, copyPlanFrom, modeKey = settings.mode) {
   const survey = {
-    id: db.uid(), name: name || 'Survey ' + ex.localStamp(Date.now()).slice(0, 16), created: Date.now(), clockOffsetS: null, obsCount: 0,
+    id: db.uid(), name: name || 'Survey ' + ex.localStamp(Date.now()).slice(0, 16), created: Date.now(), clockOffsetS: null, obsCount: 0, mode: MODES[modeKey] ? modeKey : 'ism',
     progress: 0,
-    plan: copyPlanFrom ? JSON.parse(JSON.stringify(copyPlanFrom.plan)) : { boundary: [], route: [], spacing: settings.spacing, bearing: null },
+    plan: copyPlanFrom ? JSON.parse(JSON.stringify(copyPlanFrom.plan)) : { boundary: [], route: [], points: [], spacing: settings.spacing, bearing: null },
   };
+  // A copied plan starts fresh: nothing sampled yet.
+  for (const pt of survey.plan.points || []) { pt.status = 'todo'; delete pt.why; if (pt.plat != null) { pt.lat = pt.plat; pt.lon = pt.plon; } }
+  survey.plan.target = null;
   await db.put('surveys', survey);
   return survey;
 }
-const saveSurvey = () => db.put('surveys', S.survey);
+export const saveSurvey = () => db.put('surveys', S.survey);
 
 async function loadSurvey(id) {
   if (S.recording) await stopRecording();
@@ -143,6 +157,7 @@ async function loadSurvey(id) {
     const list = await db.all('surveys');
     survey = list.sort((a, b) => b.created - a.created)[0] || (await newSurvey());
   }
+  survey.plan.points ||= []; survey.mode ||= 'ism';
   S.survey = survey;
   localStorage.setItem('sxyz.current', survey.id);
   S.points = (await db.bySurvey('points', survey.id)).sort((a, b) => a.t - b.t);
@@ -151,9 +166,10 @@ async function loadSurvey(id) {
   S.activeMs = 0; S.dist = 0;
   for (let i = 1; i < S.points.length; i++) addStats(S.points[i - 1], S.points[i]);
   $('surveyName').textContent = survey.name;
+  $('bMark').lastElementChild.textContent = mode().action === 'sample' ? 'Sample' : 'Mark';
   layers.readings.clearLayers();
   drawPlan(); rebuildRoute(true); drawTrack(); drawObs(); updateRecChip();
-  const pts = [...(survey.plan.boundary || []), ...(survey.plan.route || []), ...S.points.slice(-200).map((p) => [p.lat, p.lon])];
+  const pts = [...(survey.plan.boundary || []), ...(survey.plan.route || []), ...survey.plan.points.map((p) => [p.lat, p.lon]), ...S.points.slice(-200).map((p) => [p.lat, p.lon])];
   if (pts.length > 1) { setFollow(false); map.fitBounds(L.latLngBounds(pts).pad(0.15), { maxZoom: 19 }); }
 }
 function addStats(a, b) {
@@ -163,7 +179,8 @@ function addStats(a, b) {
 }
 
 // ---------- drawing ----------
-function drawPlan() {
+export function drawPlan() {
+  drawPoints();
   layers.plan.clearLayers();
   const { boundary, route } = S.survey.plan;
   if (boundary?.length >= 2) L.polygon(boundary, { color: '#ff9800', weight: 3, fillOpacity: 0.05, interactive: false }).addTo(layers.plan);
@@ -172,6 +189,20 @@ function drawPlan() {
     L.polyline(route, { color: '#1565c0', weight: 3, dashArray: '8 7', interactive: false }).addTo(layers.plan);
     L.circleMarker(route[0], { radius: 7, color: '#fff', weight: 2, fillColor: '#1a8f3c', fillOpacity: 1, interactive: false }).addTo(layers.plan);
     L.circleMarker(route[route.length - 1], { radius: 7, color: '#fff', weight: 2, fillColor: '#c62828', fillOpacity: 1, interactive: false }).addTo(layers.plan);
+  }
+}
+/** The sampling point guidance is heading for: the chosen one, else the first not yet done. */
+export function currentTarget() {
+  const pts = S.survey.plan.points;
+  return pts.find((p) => p.id === S.survey.plan.target && p.status === 'todo') || pts.find((p) => p.status === 'todo') || null;
+}
+function drawPoints() {
+  layers.points.clearLayers();
+  const tgt = currentTarget();
+  drawPoints.target = tgt?.id;
+  for (const pt of S.survey.plan.points) {
+    const icon = L.divIcon({ className: '', html: `<div class="spt ${pt.status}${tgt === pt ? ' tgt' : ''}"><span>${esc(pt.id)}</span></div>`, iconSize: [20, 20], iconAnchor: [10, 10] });
+    L.marker([pt.lat, pt.lon], { icon }).on('click', () => { if (!S.planShape) openPoint(pt); }).addTo(layers.points);
   }
 }
 function rebuildRoute(replay) {
@@ -204,9 +235,10 @@ function startTrackLine() {
   trackLine = L.polyline([], { color: '#ff3d00', weight: 3, interactive: false }).addTo(layers.track);
   rawLine = settings.showRaw ? L.polyline([], { color: '#ffffff', weight: 1.5, opacity: 0.8, dashArray: '2 5', interactive: false }).addTo(layers.raw) : null;
 }
-function drawObs() {
+export function drawObs() {
   layers.obs.clearLayers();
   for (const o of S.obs) {
+    if (o.kind === 'sample') continue; // shown by its sampling point
     const icon = L.divIcon({ className: '', html: `<div class="pin${o.photoIds?.length ? ' photo' : ''}">${o.num}</div>`, iconSize: [28, 28], iconAnchor: [2, 28] });
     L.marker([o.lat, o.lon], { icon }).on('click', () => openNote(o)).addTo(layers.obs);
   }
@@ -284,9 +316,51 @@ setInterval(() => {
 // at a spot a few metres further along the route from where you have got to
 // (or straight at the rejoin point when you are well off it), turned by the
 // compass so it points the right way in the real world.
+function guideKind() {
+  const hasR = !!S.follower, hasP = S.survey.plan.points.length > 0;
+  return mode().guide === 'points' ? (hasP ? 'points' : hasR ? 'route' : null) : hasR ? 'route' : hasP ? 'points' : null;
+}
+export function refreshGuide() {
+  if (S.est) guide(S.est); else if (!guideKind()) $('guide').hidden = true;
+}
+/** Navigate to the next sampling point: arrow + distance to it. */
+function guidePoints(est) {
+  const g = $('guide'), pts = S.survey.plan.points, t = currentTarget();
+  const done = pts.filter((p) => p.status !== 'todo').length;
+  g.hidden = false;
+  $('guideBar').hidden = true;
+  if (drawPoints.target !== t?.id) drawPoints();
+  if (!t) {
+    S.target = null; targetLine.remove(); g.className = '';
+    $('guideText').textContent = 'All points visited'; $('dialDist').textContent = '✓'; $('dialLabel').textContent = '';
+    $('guideSub').textContent = `${done} of ${pts.length} locations · tap for the list`;
+    turnArrow();
+    return null;
+  }
+  const d = haversine(est.lat, est.lon, t.lat, t.lon), b = bearing(est.lat, est.lon, t.lat, t.lon);
+  const here = d <= settings.arrive;
+  S.target = { bearing: b };
+  targetLine.setLatLngs([[est.lat, est.lon], [t.lat, t.lon]]).addTo(layers.me);
+  g.className = here ? '' : 'far';
+  $('guideText').textContent = here ? `At ${t.id}` : `Go to ${t.id}`;
+  $('dialDist').textContent = d < 20 ? d.toFixed(1) + ' m' : fmtDist(d);
+  $('dialLabel').textContent = 'to ' + t.id;
+  $('guideSub').textContent = `${here ? 'You are here — tap Sample' : `${cardinal(b)} (${Math.round(b)}°)`} · GPS ±${Math.round(S.fix?.acc ?? est.sigma ?? 0)} m · ${done} of ${pts.length} done`;
+  if (here && guidePoints.arrived !== t.id) {
+    guidePoints.arrived = t.id;
+    if (settings.vibrate && navigator.vibrate) navigator.vibrate(300);
+    if (settings.sound) beep();
+  }
+  turnArrow();
+  return null;
+}
+
 function guide(est) {
   const g = $('guide'), f = S.follower;
-  if (!f || S.planShape) { g.hidden = true; targetLine.remove(); return null; }
+  const kind = S.planShape ? null : guideKind();
+  if (!kind) { g.hidden = true; targetLine.remove(); return null; }
+  if (kind === 'points') return guidePoints(est);
+  $('guideBar').hidden = false;
   const p = S.route.frame.toXY(est.lat, est.lon);
   const tol = settings.tol;
   const atStart = f.s < 0.5;
@@ -363,6 +437,7 @@ function turnArrow() {
 }
 
 $('guide').onclick = () => {
+  if (guideKind() === 'points') return openPointList();
   const f = S.follower;
   if (!f) return;
   const b = openSheet('Path guidance', `
@@ -441,17 +516,40 @@ $('followBtn').onclick = () => {
 };
 
 // ---------- plan editing ----------
+const isPts = () => S.planShape === 'points';
+const defaultFill = () => (mode().guide === 'points' || (mode().guide === 'auto' && S.survey.plan.points.length && !S.survey.plan.route.length) ? 'points' : 'route');
+// What the generate row makes: on the Boundary tab it fills with whatever this survey type uses.
+const genPts = () => (S.planShape === 'boundary' ? defaultFill() : S.planShape) === 'points';
 const planPts = () => S.survey.plan[S.planShape];
 let planBefore = '';
+$('planPattern').innerHTML = Object.entries(PATTERNS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
+
+export function nextPointId(prefix) {
+  const pre = prefix ?? (S.survey.plan.prefix || 'S');
+  const re = new RegExp('^' + pre.replace(/[^\w]/g, '\\$&') + '(\\d+)$');
+  const n = S.survey.plan.points.reduce((m, p) => Math.max(m, +(p.id.match(re) || [])[1] || 0), 0) + 1;
+  return pre + String(n).padStart(2, '0');
+}
+export function addPoint(lat, lon, kind, id) {
+  const taken = new Set(S.survey.plan.points.map((p) => p.id));
+  const pt = { id: id && !taken.has(id) ? id : nextPointId(), lat, lon, kind, status: 'todo' };
+  S.survey.plan.points.push(pt);
+  return pt;
+}
+
 function enterPlan() {
   if (S.recording) { toast('Stop recording before editing the plan.'); return; }
   closeSheet();
-  planBefore = JSON.stringify(S.survey.plan.route);
-  S.planShape = S.survey.plan.boundary?.length || !S.survey.plan.route?.length ? 'boundary' : 'route';
+  const plan = S.survey.plan;
+  planBefore = JSON.stringify(plan.route);
+  const fill = defaultFill();
+  S.planShape = plan.boundary.length ? fill : plan[fill].length ? fill : 'boundary';
   $('planbar').hidden = false; $('guide').hidden = true; $('crosshair').hidden = false;
   $('bPlan').classList.add('on');
-  $('planSpacing').value = S.survey.plan.spacing || settings.spacing;
-  $('planBearing').value = S.survey.plan.bearing ?? '';
+  targetLine.remove();
+  $('planSpacing').value = plan.spacing || settings.spacing;
+  $('planBearing').value = plan.bearing ?? '';
+  $('planPattern').value = plan.pattern || 'square';
   refreshPlanEdit();
 }
 function exitPlan() {
@@ -460,40 +558,63 @@ function exitPlan() {
   $('bPlan').classList.remove('on');
   layers.edit.clearLayers();
   if (JSON.stringify(S.survey.plan.route) !== planBefore) S.survey.progress = 0;
-  saveSurvey(); rebuildRoute(true);
-  if (S.est) guide(S.est);
+  saveSurvey(); drawPlan(); rebuildRoute(true);
+  refreshGuide();
 }
 function refreshPlanEdit() {
-  document.querySelectorAll('#planbar .seg button').forEach((b) => b.classList.toggle('on', b.dataset.shape === S.planShape));
-  $('planGen').hidden = S.planShape !== 'boundary';
+  const shape = S.planShape;
+  document.querySelectorAll('#planbar .seg button').forEach((b) => b.classList.toggle('on', b.dataset.shape === shape));
+  const random = genPts() && $('planPattern').value === 'random';
+  $('planGen').hidden = shape === 'boundary' && S.survey.plan.boundary.length < 3;
+  $('planPattern').hidden = $('lblKeep').hidden = !genPts();
+  $('lblRandom').hidden = !genPts() || random;
+  $('lblCount').hidden = !random;
+  $('lblSpacing').hidden = $('lblBearing').hidden = random;
+  $('planGenerate').textContent = genPts() ? 'Generate points' : 'Fill with transects';
   drawPlan();
   layers.edit.clearLayers();
   const pts = planPts();
   if (pts.length <= 400) pts.forEach((p, i) => {
-    const m = L.marker(p, { draggable: true, icon: L.divIcon({ className: '', html: `<div class="vtx ${S.planShape}"></div>`, iconSize: [22, 22], iconAnchor: [11, 11] }) });
-    m.on('drag', () => { const ll = m.getLatLng(); pts[i] = [ll.lat, ll.lng]; drawPlan(); });
-    m.on('dragend', () => { saveSurvey(); planInfo(); });
+    const m = L.marker(isPts() ? [p.lat, p.lon] : p, { draggable: true, icon: L.divIcon({ className: '', html: `<div class="vtx ${shape}"></div>`, iconSize: [22, 22], iconAnchor: [11, 11] }) });
+    m.on('drag', () => {
+      const ll = m.getLatLng();
+      if (isPts()) { p.lat = ll.lat; p.lon = ll.lng; } else pts[i] = [ll.lat, ll.lng];
+    });
+    m.on('dragend', () => { saveSurvey(); drawPlan(); planInfo(); });
     m.addTo(layers.edit);
   });
   planInfo();
 }
 function planInfo() {
-  const { boundary, route } = S.survey.plan;
+  const { boundary, route, points } = S.survey.plan;
   const bits = [];
   if (boundary.length >= 3) { const a = polygonArea(boundary); bits.push(`Area ${a >= 10000 ? (a / 10000).toFixed(2) + ' ha' : Math.round(a) + ' m²'}`); }
-  if (route.length >= 2) { const len = pathLength(route); bits.push(`Route ${fmtDist(len)} · ${route.length - 1} legs · about ${Math.max(1, Math.round(len / 60))} min at 1 m/s`); }
-  $('planInfo').textContent = bits.join(' · ') || (S.planShape === 'boundary'
-    ? 'Tap the map to add boundary corners (or “+ Here” while walking the edge), then fill it with transects.'
-    : 'Tap the map to add route points in walking order. Drag points to adjust.');
+  if (route.length >= 2 && !genPts()) { const len = pathLength(route); bits.push(`Route ${fmtDist(len)} · ${route.length - 1} legs · about ${Math.max(1, Math.round(len / 60))} min at 1 m/s`); }
+  if (genPts()) {
+    if (points.length) {
+      const kinds = {};
+      points.forEach((p) => { kinds[p.kind] = (kinds[p.kind] || 0) + 1; });
+      bits.push(`${points.length} points (${Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ')})`);
+    }
+    const G = parseFloat($('planSpacing').value);
+    if (G > 0 && $('planPattern').value !== 'random') {
+      bits.push(`${G} m square grid finds circular hotspots ≥ ${hotspotDiameter(G).toFixed(1)} m across (95%)` + (boundary.length >= 3 ? `, about ${Math.round(polygonArea(boundary) / (G * G))} points` : ''));
+    }
+    if (isPts()) bits.push('Tap the map to add targeted points');
+  }
+  const hint = { boundary: 'Tap the map to add boundary corners (or “+ Here” while walking the edge), then switch to Route or Points to fill it.', route: 'Tap the map to add route points in walking order. Drag points to adjust.' };
+  $('planInfo').textContent = bits.join(' · ') || hint[S.planShape];
 }
 function addVertex(lat, lon) {
-  planPts().push([lat, lon]);
+  if (isPts()) addPoint(lat, lon, 'targeted'); else planPts().push([lat, lon]);
   saveSurvey(); refreshPlanEdit();
 }
 map.on('click', (e) => { if (S.planShape) addVertex(e.latlng.lat, e.latlng.lng); });
 $('bPlan').onclick = () => (S.planShape ? exitPlan() : enterPlan());
 $('planDone').onclick = exitPlan;
 document.querySelectorAll('#planbar .seg button').forEach((b) => { b.onclick = () => { S.planShape = b.dataset.shape; refreshPlanEdit(); }; });
+$('planPattern').onchange = refreshPlanEdit;
+$('planSpacing').oninput = planInfo;
 $('planGps').onclick = () => {
   if (!S.est) return toast('No GPS fix yet.');
   if (S.fix.acc > settings.maxAcc) return toast(`GPS too poor right now (±${Math.round(S.fix.acc)} m).`);
@@ -501,16 +622,33 @@ $('planGps').onclick = () => {
 };
 $('planUndo').onclick = () => { planPts().pop(); saveSurvey(); refreshPlanEdit(); };
 $('planClear').onclick = () => {
-  if (!planPts().length || !confirm(`Clear the ${S.planShape}?`)) return;
+  if (!planPts().length || !confirm(`Clear the ${isPts() ? 'sampling points' : S.planShape}?`)) return;
   S.survey.plan[S.planShape] = []; saveSurvey(); refreshPlanEdit();
 };
 $('planGenerate').onclick = () => {
   const plan = S.survey.plan;
-  if (plan.boundary.length < 3) return toast('Add at least 3 boundary corners first.');
+  if (plan.boundary.length < 3) return toast('Draw a boundary first (at least 3 corners).');
+  const random = genPts() && $('planPattern').value === 'random';
   const spacing = parseFloat($('planSpacing').value);
-  if (!(spacing >= 0.5)) return toast('Enter a spacing in metres.');
+  if (!random && !(spacing >= 0.5)) return toast('Enter a spacing in metres.');
   let b = parseFloat($('planBearing').value);
   if (!Number.isFinite(b)) { b = longestEdgeBearing(plan.boundary); $('planBearing').value = b; }
+  if (genPts()) {
+    const count = parseInt($('planCount').value, 10);
+    if (random && !(count > 0)) return toast('Enter how many random points you want.');
+    const pattern = $('planPattern').value;
+    const made = samplePoints(plan.boundary, { pattern, spacing, bearing: b, count, randomStart: $('planRandom').checked });
+    if (!made.length) return toast('No points fit inside the boundary at that spacing.');
+    if (made.length > 2000) return toast(`That would be ${made.length} points — use a larger spacing.`, 5000);
+    const keep = $('planKeep').checked;
+    if (!keep && plan.points.length && !confirm(`Replace the ${plan.points.length} existing points? (Tick “Keep existing” to add to them instead.)`)) return;
+    if (!keep) plan.points = [];
+    for (const [lat, lon] of made) addPoint(lat, lon, pattern === 'random' ? 'random' : 'grid');
+    Object.assign(plan, { pattern, spacing: random ? plan.spacing : spacing, bearing: b });
+    S.planShape = 'points';
+    saveSurvey(); refreshPlanEdit();
+    return toast(`${made.length} sampling points ${keep ? 'added' : 'created'}.`);
+  }
   if (plan.route.length && !confirm('Replace the existing route?')) return;
   const route = generateTransects(plan.boundary, spacing, b);
   if (route.length < 2) return toast('Boundary is too small for that spacing.');
@@ -524,29 +662,32 @@ $('planImport').onclick = async () => {
   if (!file) return;
   try {
     const res = ex.parsePlanFile(await file.text());
-    if (res.boundary) S.survey.plan.boundary = res.boundary;
-    if (res.route) S.survey.plan.route = res.route;
+    const plan = S.survey.plan;
+    if (res.boundary) plan.boundary = res.boundary;
+    if (res.route) plan.route = res.route;
+    for (const p of res.points) addPoint(p.lat, p.lon, 'imported', p.id != null ? String(p.id) : null);
     saveSurvey(); refreshPlanEdit();
     setFollow(false);
-    map.fitBounds(L.latLngBounds([...(res.boundary || []), ...(res.route || [])]).pad(0.15));
-    toast(`Imported ${[res.boundary && 'boundary', res.route && 'route'].filter(Boolean).join(' and ')}.`);
+    map.fitBounds(L.latLngBounds([...(res.boundary || []), ...(res.route || []), ...res.points.map((p) => [p.lat, p.lon])]).pad(0.15), { maxZoom: 19 });
+    toast(`Imported ${[res.boundary && 'boundary', res.route && 'route', res.points.length && `${res.points.length} points`].filter(Boolean).join(', ')}.`);
   } catch (e) { toast('Import failed: ' + e.message, 6000); }
 };
 
 // ---------- observations ----------
-function currentSpot() {
+export function currentSpot() {
   if (S.est && (S.est.used || filter.ready)) return { lat: S.est.lat, lon: S.est.lon, acc: S.fix?.acc ?? null, from: 'gps' };
   const c = map.getCenter();
   return { lat: c.lat, lon: c.lng, acc: null, from: 'map' };
 }
-async function saveObs(o) {
+export async function saveObs(o) {
   if (!o.num) { o.num = ++S.survey.obsCount; S.obs.push(o); saveSurvey(); }
   await db.put('obs', o);
   drawObs();
 }
 $('bMark').onclick = async () => {
+  if (mode().action === 'sample') return startSample();
   const spot = currentSpot();
-  const o = { id: db.uid(), surveyId: S.survey.id, t: Date.now(), ...spot, category: '', note: '', reading: null, unit: settings.unit, extent: null, photoIds: [] };
+  const o = { id: db.uid(), surveyId: S.survey.id, t: Date.now(), ...spot, category: '', note: '', reading: null, unit: noteUnit(), extent: null, photoIds: [] };
   await saveObs(o);
   if (navigator.vibrate) navigator.vibrate(60);
   toast(`Mark ${o.num} dropped${spot.from === 'map' ? ' at map centre (no GPS)' : ` (±${Math.round(spot.acc)} m)`}. Tap it to add details.`);
@@ -565,21 +706,64 @@ async function shrinkPhoto(file) {
   } catch { return file; }
 }
 
+/**
+ * Photo picker shared by the note and sample forms. Mutates o.photoIds;
+ * nothing touches the database until save() is called.
+ */
+export function photoEditor(el, o) {
+  const fresh = new Map(), removed = [], urls = [];
+  el.innerHTML = `<div class="actions" style="margin-top:6px"><button class="btn primary" data-p="environment">Take photo</button><button class="btn" data-p="">Add from gallery</button></div><div class="thumbs"></div>`;
+  const thumbs = async () => {
+    const box = el.querySelector('.thumbs');
+    box.innerHTML = '';
+    for (const id of o.photoIds) {
+      const blob = fresh.get(id) || (await db.get('photos', id))?.blob;
+      if (!blob) continue;
+      const url = URL.createObjectURL(blob); urls.push(url);
+      const d = document.createElement('div');
+      d.innerHTML = `<img src="${url}" alt="photo"><button aria-label="Remove photo">✕</button>`;
+      d.querySelector('button').onclick = () => { o.photoIds = o.photoIds.filter((x) => x !== id); if (!fresh.delete(id)) removed.push(id); thumbs(); };
+      d.querySelector('img').onclick = () => window.open(url, '_blank');
+      box.appendChild(d);
+    }
+  };
+  thumbs();
+  el.querySelector('.actions').onclick = async (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    const file = await pickFile('image/*', b.dataset.p || null);
+    if (!file) return;
+    const id = db.uid();
+    fresh.set(id, await shrinkPhoto(file));
+    o.photoIds.push(id);
+    thumbs();
+  };
+  return {
+    async save() {
+      for (const [id, blob] of fresh) await db.put('photos', { id, surveyId: S.survey.id, obsId: o.id, blob });
+      for (const id of removed) await db.del('photos', id);
+    },
+    dispose() { urls.forEach(URL.revokeObjectURL); },
+  };
+}
+export async function deleteObs(o) {
+  for (const id of o.photoIds || []) await db.del('photos', id);
+  await db.del('obs', o.id);
+  S.obs = S.obs.filter((x) => x.id !== o.id);
+  drawObs();
+}
+
 async function openNote(existing) {
+  if (existing?.kind === 'sample') return openSample(null, existing);
   // Position and time are captured the moment the button is pressed, not when saved.
   const o = existing ? { ...existing, photoIds: [...(existing.photoIds || [])] }
-    : { id: db.uid(), surveyId: S.survey.id, t: Date.now(), ...currentSpot(), category: '', note: '', reading: null, unit: settings.unit, extent: null, photoIds: [] };
-  const newPhotos = new Map(); // id -> blob (not yet saved)
-  const removed = [];
-  const urls = [];
-  const cats = settings.categories.split(',').map((s) => s.trim()).filter(Boolean);
+    : { id: db.uid(), surveyId: S.survey.id, t: Date.now(), ...currentSpot(), category: '', note: '', reading: null, unit: noteUnit(), extent: null, photoIds: [] };
+  const cats = noteCategories();
+  if (o.category && !cats.includes(o.category)) cats.push(o.category);
+  let photos;
   const body = openSheet(existing ? `Note ${o.num}` : 'New note', `
     <p class="muted" id="nPos"></p>
-    <div class="actions" style="margin-top:6px">
-      <button class="btn primary" id="nCam">Take photo</button>
-      <button class="btn" id="nGal">Add from gallery</button>
-    </div>
-    <div class="thumbs" id="nThumbs"></div>
+    <div id="nPhotos"></div>
     <div class="chips" id="nCats">${cats.map((c) => `<button data-c="${esc(c)}" class="${c === o.category ? 'on' : ''}">${esc(c)}</button>`).join('')}</div>
     <label class="field">Note<textarea id="nNote" placeholder="What did you see?">${esc(o.note)}</textarea></label>
     <div class="two">
@@ -591,35 +775,11 @@ async function openNote(existing) {
     <div class="actions">
       ${existing ? '<button class="btn danger" id="nDel">Delete</button>' : ''}
       <button class="btn primary" id="nSave">Save</button>
-    </div>`, () => { urls.forEach(URL.revokeObjectURL); $('crosshair').hidden = !S.planShape; });
+    </div>`, () => { photos.dispose(); $('crosshair').hidden = !S.planShape; });
   const q = (s) => body.querySelector(s);
+  photos = photoEditor(q('#nPhotos'), o);
   const posText = () => { q('#nPos').textContent = `${ex.localStamp(o.t)} · ${o.lat.toFixed(6)}, ${o.lon.toFixed(6)} · ${o.from === 'map' || o.acc == null ? 'placed on map' : `GPS ±${Math.round(o.acc)} m`}`; };
   posText();
-  const thumbs = async () => {
-    const el = q('#nThumbs');
-    el.innerHTML = '';
-    for (const id of o.photoIds) {
-      const blob = newPhotos.get(id) || (await db.get('photos', id))?.blob;
-      if (!blob) continue;
-      const url = URL.createObjectURL(blob); urls.push(url);
-      const d = document.createElement('div');
-      d.innerHTML = `<img src="${url}" alt="photo"><button aria-label="Remove photo">✕</button>`;
-      d.querySelector('button').onclick = () => { o.photoIds = o.photoIds.filter((x) => x !== id); if (!newPhotos.delete(id)) removed.push(id); thumbs(); };
-      d.querySelector('img').onclick = () => window.open(url, '_blank');
-      el.appendChild(d);
-    }
-  };
-  thumbs();
-  const addPhoto = async (capture) => {
-    const file = await pickFile('image/*', capture);
-    if (!file) return;
-    const id = db.uid();
-    newPhotos.set(id, await shrinkPhoto(file));
-    o.photoIds.push(id);
-    thumbs();
-  };
-  q('#nCam').onclick = () => addPhoto('environment');
-  q('#nGal').onclick = () => addPhoto(null);
   q('#nCats').onclick = (e) => {
     const b = e.target.closest('button');
     if (!b) return;
@@ -634,8 +794,7 @@ async function openNote(existing) {
     o.reading = r === '' ? null : Number(r);
     o.unit = q('#nUnit').value.trim();
     o.extent = x === '' ? null : Number(x);
-    for (const [id, blob] of newPhotos) await db.put('photos', { id, surveyId: S.survey.id, obsId: o.id, blob });
-    for (const id of removed) await db.del('photos', id);
+    await photos.save();
     if (existing) Object.assign(existing, o);
     await saveObs(existing || o);
     closeSheet();
@@ -643,33 +802,50 @@ async function openNote(existing) {
   };
   if (existing) q('#nDel').onclick = async () => {
     if (!confirm(`Delete note ${o.num} and its photos?`)) return;
-    for (const id of existing.photoIds || []) await db.del('photos', id);
-    await db.del('obs', o.id);
-    S.obs = S.obs.filter((x) => x.id !== o.id);
-    drawObs(); closeSheet();
+    await deleteObs(existing);
+    closeSheet();
   };
 }
 
 // ---------- menu ----------
 $('bMenu').onclick = () => {
+  const soil = mode().action === 'sample' || S.survey.plan.points.length;
+  const notes = ex.notesOnly(S.obs).length, samples = ex.samplesOnly(S.obs).length;
   const b = openSheet('Menu', `<div class="list">
+    <button class="btn" data-a="mode">Survey type: ${esc(mode().name)}<small>Tap to change</small></button>
+    ${soil ? `<button class="btn" data-a="points">Sampling points<small>${S.survey.plan.points.filter((p) => p.status !== 'todo').length} of ${S.survey.plan.points.length} visited</small></button>
+    <button class="btn" data-a="samples">Samples<small>${samples} logged</small></button>` : ''}
     <button class="btn primary" data-a="export">Export data<small>ZIP for QGIS, CSV, GPX, GeoJSON</small></button>
     <button class="btn" data-a="merge">Merge instrument readings<small>Match a gas monitor CSV to this track by time</small></button>
     <button class="btn" data-a="clock">Instrument clock sync<small>${S.survey.clockOffsetS == null ? 'Not set for this survey' : `Offset ${S.survey.clockOffsetS} s`}</small></button>
-    <button class="btn" data-a="notes">Notes &amp; marks<small>${S.obs.length} in this survey</small></button>
+    <button class="btn" data-a="notes">Notes &amp; marks<small>${notes} in this survey</small></button>
     <button class="btn" data-a="surveys">Surveys<small>New, switch, rename, delete, restore backup</small></button>
     <button class="btn" data-a="settings">Settings &amp; offline maps</button>
     <button class="btn" data-a="help">How it works</button>
   </div>`);
   b.querySelector('.list').onclick = (e) => {
     const a = e.target.closest('button')?.dataset.a;
-    if (a) ({ export: openExport, merge: () => openMerge(), clock: openClock, notes: openNotesList, surveys: openSurveys, settings: openSettings, help: openHelp })[a]();
+    if (a) ({ mode: openMode, points: openPointList, samples: openSamplesList, export: openExport, merge: () => openMerge(), clock: openClock, notes: openNotesList, surveys: openSurveys, settings: openSettings, help: openHelp })[a]();
   };
 };
 $('surveyBtn').onclick = () => openSurveys();
 
+function openMode() {
+  const b = openSheet('Survey type', `<p class="muted">The type sets how this survey is planned and guided and what the quick button records. You can change it at any time; nothing already recorded is lost.</p>
+    <div class="list">${Object.entries(MODES).map(([k, m]) => `<button class="btn ${k === S.survey.mode ? 'primary' : ''}" data-m="${k}"><span>${esc(m.name)}<small>${esc(m.blurb)}</small></span></button>`).join('')}</div>`);
+  b.querySelector('.list').onclick = async (e) => {
+    const k = e.target.closest('button')?.dataset.m;
+    if (!k) return;
+    S.survey.mode = settings.mode = k; saveSettings(); await saveSurvey();
+    $('bMark').lastElementChild.textContent = mode().action === 'sample' ? 'Sample' : 'Mark';
+    refreshGuide(); closeSheet();
+    toast(`This survey is now “${mode().name}”.`);
+  };
+}
+
 function openNotesList() {
-  const b = openSheet('Notes & marks', S.obs.length ? `<div class="list">${S.obs.map((o) => `<button class="btn" data-id="${o.id}"><span><b>${o.num}</b> ${esc(o.category || 'Mark')}${o.reading != null ? ` · ${o.reading} ${esc(o.unit || '')}` : ''}
+  const list = ex.notesOnly(S.obs);
+  const b = openSheet('Notes & marks', list.length ? `<div class="list">${list.map((o) => `<button class="btn" data-id="${o.id}"><span><b>${o.num}</b> ${esc(o.category || 'Mark')}${o.reading != null ? ` · ${o.reading} ${esc(o.unit || '')}` : ''}
     <small>${ex.localStamp(o.t).slice(11)}${o.photoIds?.length ? ` · ${o.photoIds.length} photo${o.photoIds.length > 1 ? 's' : ''}` : ''}${o.note ? ' · ' + esc(o.note.slice(0, 60)) : ''}</small></span></button>`).join('')}</div>`
     : '<p class="muted">Nothing yet. Use Mark for a one-tap pin, or Note for a photo, category, reading and text.</p>');
   b.onclick = (e) => {
@@ -692,6 +868,8 @@ async function exportZip() {
     { name: 'track_points.geojson', data: JSON.stringify(ex.trackPointsGeoJSON(points)) },
     { name: 'observations.geojson', data: JSON.stringify(ex.obsGeoJSON(obs)) },
     { name: 'observations.csv', data: ex.obsCSV(obs) },
+    { name: 'samples.csv', data: ex.samplesCSV(survey, obs) },
+    { name: 'samples.geojson', data: JSON.stringify(ex.samplesGeoJSON(survey, obs)) },
     { name: 'plan.geojson', data: JSON.stringify(ex.planGeoJSON(survey)) },
     { name: 'track.gpx', data: ex.gpx(survey, points, obs) },
     { name: 'survey.json', data: backupJSON() },
@@ -709,14 +887,15 @@ async function exportZip() {
 function openExport() {
   const n = ex.safeName(S.survey.name);
   const b = openSheet('Export', `
-    <p class="muted">${S.points.length} GPS fixes · ${S.obs.length} notes · ${fmtDist(S.dist)}. Coordinates are WGS84 (EPSG:4326).</p>
+    <p class="muted">${S.points.length} GPS fixes · ${ex.notesOnly(S.obs).length} notes · ${ex.samplesOnly(S.obs).length} samples · ${fmtDist(S.dist)}. Coordinates are WGS84 (EPSG:4326).</p>
     <div class="list">
       <button class="btn primary" data-a="zip">Everything (.zip)<small>All files below + photos + README. Unzip and drag into QGIS.</small></button>
       <button class="btn" data-a="csv">Track table (.csv)<small>One row per fix: time, lat/lon, raw lat/lon, accuracy</small></button>
       <button class="btn" data-a="geojson">Map layers (.geojson)<small>Plan, walked line and notes in one file</small></button>
       <button class="btn" data-a="gpx">GPX<small>Track, waypoints and planned route</small></button>
+      <button class="btn" data-a="samples">Sample register (.csv)<small>One row per sample: ID, location, depth, type, description, analysis, coordinates</small></button>
       <button class="btn" data-a="obs">Notes table (.csv)</button>
-      <button class="btn" data-a="plan">Plan only (.geojson)<small>Boundary + route, re-importable for the next visit</small></button>
+      <button class="btn" data-a="plan">Plan only (.geojson)<small>Boundary, route and sampling points; re-importable for the next visit</small></button>
       <button class="btn" data-a="json">Backup (.json)<small>Restore later via Surveys → Restore backup (no photos)</small></button>
     </div>`);
   b.querySelector('.list').onclick = async (e) => {
@@ -728,6 +907,7 @@ function openExport() {
       if (a === 'csv') await text(ex.trackCSV(S.points), `${n}_track.csv`, 'text/csv');
       if (a === 'geojson') await text(JSON.stringify(ex.allGeoJSON(S.survey, S.points, S.obs)), `${n}.geojson`, 'application/geo+json');
       if (a === 'gpx') await text(ex.gpx(S.survey, S.points, S.obs), `${n}.gpx`, 'application/gpx+xml');
+      if (a === 'samples') await text(ex.samplesCSV(S.survey, S.obs), `${n}_samples.csv`, 'text/csv');
       if (a === 'obs') await text(ex.obsCSV(S.obs), `${n}_notes.csv`, 'text/csv');
       if (a === 'plan') await text(JSON.stringify(ex.planGeoJSON(S.survey)), `${n}_plan.geojson`, 'application/geo+json');
       if (a === 'json') await text(backupJSON(), `${n}_backup.json`, 'application/json');
@@ -769,16 +949,18 @@ async function openSurveys() {
   const list = (await db.all('surveys')).sort((a, b) => b.created - a.created);
   const b = openSheet('Surveys', `
     <label class="field">New survey name<input id="sName" placeholder="e.g. North cell – Nov ISM"></label>
-    <label class="field inline"><input type="checkbox" id="sCopy" ${S.survey.plan.route.length || S.survey.plan.boundary.length ? 'checked' : ''}>Copy boundary and route from “${esc(S.survey.name)}”</label>
+    <label class="field">Survey type<select id="sMode">${Object.entries(MODES).map(([k, m]) => `<option value="${k}" ${k === S.survey.mode ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></label>
+    <label class="field inline"><input type="checkbox" id="sCopy" ${S.survey.plan.route.length || S.survey.plan.boundary.length ? 'checked' : ''}>Copy the plan (boundary, route, points) from “${esc(S.survey.name)}”</label>
     <div class="actions"><button class="btn primary" id="sNew">Create</button><button class="btn" id="sImport">Restore backup</button></div>
     <h3>On this device</h3>
     <div class="list">${list.map((s) => `<div class="survey-row ${s.id === S.survey.id ? 'cur' : ''}" data-id="${s.id}">
-      <b>${esc(s.name)}</b><div class="muted">${ex.localStamp(s.created).slice(0, 16)}${s.id === S.survey.id ? ' · open' : ''}</div>
+      <b>${esc(s.name)}</b><div class="muted">${esc((MODES[s.mode] || MODES.ism).name)} · ${ex.localStamp(s.created).slice(0, 16)}${s.id === S.survey.id ? ' · open' : ''}</div>
       <div class="row">${s.id === S.survey.id ? '' : '<button class="btn primary" data-a="open">Open</button>'}<button class="btn" data-a="rename">Rename</button><button class="btn danger" data-a="delete">Delete</button></div>
     </div>`).join('')}</div>`);
   const q = (s) => b.querySelector(s);
   q('#sNew').onclick = async () => {
-    const s = await newSurvey(q('#sName').value.trim(), q('#sCopy').checked ? S.survey : null);
+    const s = await newSurvey(q('#sName').value.trim(), q('#sCopy').checked ? S.survey : null, q('#sMode').value);
+    settings.mode = s.mode; saveSettings();
     await loadSurvey(s.id); closeSheet(); toast(`“${s.name}” created.`);
   };
   q('#sImport').onclick = async () => {
@@ -856,9 +1038,13 @@ function openSettings() {
     <label class="field">Off-path tolerance (metres)<input id="oTol" type="number" min="0.5" step="0.5" value="${settings.tol}"></label>
     <label class="field inline"><input type="checkbox" id="oSound" ${settings.sound ? 'checked' : ''}>Beep when off path</label>
     <label class="field inline"><input type="checkbox" id="oVib" ${settings.vibrate ? 'checked' : ''}>Vibrate when off path (Android)</label>
-    <h3>Notes</h3>
-    <label class="field">Categories (comma separated)<textarea id="oCats">${esc(settings.categories)}</textarea></label>
-    <label class="field">Default reading unit<input id="oUnit" value="${esc(settings.unit)}"></label>
+    <label class="field">Sampling point “arrived” distance (metres)<input id="oArrive" type="number" min="0.5" step="0.5" value="${settings.arrive}"></label>
+    <h3>Notes — ${esc(mode().name)}</h3>
+    <label class="field">Categories (comma separated)<textarea id="oCats">${esc(noteCategories().join(', '))}</textarea></label>
+    <label class="field">Default reading unit<input id="oUnit" value="${esc(noteUnit())}"></label>
+    <h3>Samples</h3>
+    <label class="field">Analysis options (comma separated)<textarea id="oAnalytes">${esc(settings.analytes)}</textarea></label>
+    <label class="field">Sampling point ID prefix for this survey<input id="oPrefix" value="${esc(S.survey.plan.prefix || 'S')}"></label>
     <h3>Offline maps</h3>
     <p class="muted">Map tiles you have looked at are kept for offline use. To prepare a site, frame it on the map with the basemap you want, then:</p>
     <div class="actions"><button class="btn primary" id="oSaveMap">Save this map area</button><button class="btn" id="oClearMap">Clear saved maps</button></div>
@@ -868,13 +1054,16 @@ function openSettings() {
     const tol = settings.tol;
     Object.assign(settings, {
       filterMode: q('#oMode').value, maxAcc: num('#oAcc', 5, 25), showRaw: q('#oRaw').checked, tol: num('#oTol', 0.5, 3),
-      sound: q('#oSound').checked, vibrate: q('#oVib').checked, categories: q('#oCats').value, unit: q('#oUnit').value.trim(),
+      sound: q('#oSound').checked, vibrate: q('#oVib').checked, arrive: num('#oArrive', 0.5, 3), analytes: q('#oAnalytes').value,
+      ['cats_' + S.survey.mode]: q('#oCats').value, ['unit_' + S.survey.mode]: q('#oUnit').value.trim(),
     });
+    const prefix = q('#oPrefix').value.trim() || 'S';
+    if (prefix !== (S.survey.plan.prefix || 'S')) { S.survey.plan.prefix = prefix; saveSurvey(); }
     saveSettings();
     if (filter.o.mode !== settings.filterMode) { filter.o.mode = settings.filterMode; filter.reset(); }
     filter.o.maxAcc = settings.maxAcc;
     if (tol !== settings.tol) rebuildRoute(true);
-    drawTrack();
+    drawTrack(); refreshGuide();
   });
   b.querySelector('#oMode').value = settings.filterMode;
   b.querySelector('#oSaveMap').onclick = saveOffline;
@@ -884,8 +1073,13 @@ function openSettings() {
 
 function openHelp() {
   openSheet('How it works', `
+    <h3>Survey types</h3>
+    <p>Each survey has a type (<b>Menu → Survey type</b>): <b>Gas walkover (ISM)</b> follows a walked route; <b>Contaminated land sampling</b> plans sampling points and logs samples; <b>General</b> is plain tracking, notes and photos.</p>
     <h3>1 · Plan</h3>
     <p>Tap <b>Plan</b>, tap the corners of the area (or walk the edge pressing <b>+ Here</b>), set a spacing and press <b>Fill with transects</b> for a back-and-forth walk pattern. Or switch to <b>Route</b> and tap out any path. Boundaries and routes can also be imported from GeoJSON, KML or GPX.</p>
+    <p><b>Sampling points:</b> draw the boundary, switch to <b>Points</b>, pick a pattern (square, triangular or herringbone grid, or random), set the spacing and <b>Generate points</b>. Tap the map to add targeted points at known sources. Tick <b>Keep existing</b> to layer a finer grid over part of the site: redraw the boundary round that part and generate again. The app shows the hotspot size a grid spacing will find; the choice still needs site-specific justification in your sampling plan.</p>
+    <h3>Sampling</h3>
+    <p>The arrow leads to the next point with the distance to it. Tap <b>Sample</b> on arrival: the sample ID, depth, type (primary, duplicate, blanks), method, soil description, evidence of contamination, PID reading, analysis and photos are saved against the location with the position you actually sampled at. <b>Save + next depth</b> logs another depth at the same spot. Tap a point on the map to navigate to it, mark it as not sampled with a reason, move it, or add step-out points around it.</p>
     <h3>2 · Sync the instrument clock</h3>
     <p><b>Menu → Instrument clock sync</b> before you start. This is what makes the later merge line up.</p>
     <h3>3 · Record</h3>

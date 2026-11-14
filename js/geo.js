@@ -262,3 +262,66 @@ export class RouteFollower {
     return r;
   }
 }
+
+export function pointInPolygon(poly, p) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i], [xj, yj] = poly[j];
+    if ((yi > p[1]) !== (yj > p[1]) && p[0] < ((xj - xi) * (p[1] - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+/**
+ * Sampling locations inside a boundary. o: {pattern, spacing, bearing, count, randomStart}.
+ *  square / triangular / herringbone: systematic grids at `spacing` metres, rows along `bearing`.
+ *  random: `count` uniformly random locations.
+ * Returned in a walkable order (serpentine rows; nearest-neighbour for random). [[lat,lon], ...]
+ */
+export function samplePoints(boundary, o, rnd = Math.random) {
+  if (boundary.length < 3) return [];
+  const f = frameFor(boundary);
+  const b = rad(o.bearing || 0);
+  const u = [Math.sin(b), Math.cos(b)], v = [Math.cos(b), -Math.sin(b)];
+  const ab = boundary.map((p) => { const [x, y] = f.toXY(p[0], p[1]); return [x * v[0] + y * v[1], x * u[0] + y * u[1]]; });
+  let minA = Infinity, maxA = -Infinity, minB = Infinity, maxB = -Infinity;
+  for (const p of ab) { minA = Math.min(minA, p[0]); maxA = Math.max(maxA, p[0]); minB = Math.min(minB, p[1]); maxB = Math.max(maxB, p[1]); }
+  let out = [];
+  if (o.pattern === 'random') {
+    const n = Math.max(0, Math.floor(o.count || 0));
+    for (let tries = 0; out.length < n && tries < n * 500; tries++) {
+      const p = [minA + rnd() * (maxA - minA), minB + rnd() * (maxB - minB)];
+      if (pointInPolygon(ab, p)) out.push(p);
+    }
+    // nearest-neighbour walk order
+    const rest = out, ordered = [];
+    let cur = rest.reduce((m, p) => (p[0] + p[1] < m[0] + m[1] ? p : m), rest[0]);
+    while (rest.length) {
+      let k = 0, best = Infinity;
+      rest.forEach((p, i) => { const d = Math.hypot(p[0] - cur[0], p[1] - cur[1]); if (d < best) { best = d; k = i; } });
+      cur = rest.splice(k, 1)[0]; ordered.push(cur);
+    }
+    out = ordered;
+  } else {
+    const G = o.spacing;
+    if (!(G > 0)) return [];
+    const tri = o.pattern === 'triangular', her = o.pattern === 'herringbone';
+    const rowStep = tri ? (G * Math.sqrt(3)) / 2 : G;
+    const offA = (o.randomStart ? rnd() : 0.5) * G, offB = (o.randomStart ? rnd() : 0.5) * rowStep;
+    let flip = false;
+    for (let j = -1, bb = minB + offB - rowStep; bb <= maxB + G; j++, bb += rowStep) {
+      const row = [];
+      for (let i = -1, a = minA + offA - G; a <= maxA + G; i++, a += G) {
+        const jo = ((j % 2) + 2) % 2, io = ((i % 2) + 2) % 2;
+        const p = [a + (tri ? jo * G / 2 : her ? (jo ? 0.25 : -0.25) * G : 0), bb + (her ? (io ? 0.25 : -0.25) * G : 0)];
+        if (pointInPolygon(ab, p)) row.push(p);
+      }
+      if (!row.length) continue;
+      row.sort((p, q) => p[0] - q[0]);
+      if (flip) row.reverse();
+      out.push(...row);
+      flip = !flip;
+    }
+  }
+  return out.map(([a, bb]) => f.toLL(a * v[0] + bb * u[0], a * v[1] + bb * u[1]));
+}

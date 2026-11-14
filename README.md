@@ -1,8 +1,9 @@
 # SurveyXYZ
 
-A phone/tablet web app for walked field surveys (built around landfill surface gas monitoring):
-plan a walk pattern, stay on it, record a cleaned-up GPS track, drop geotagged notes and photos,
-then merge the gas monitor's own log onto the track by time and take it all into QGIS.
+A phone/tablet web app for field surveys: plan a walk pattern or a set of sampling locations, be
+guided round it, record a cleaned-up GPS track, log geotagged notes, photos and samples, and take
+it all into QGIS. It has presets for landfill surface gas walkovers (with merging of the gas
+monitor's own log onto the track by time) and for contaminated land soil sampling.
 
 No install, no account, no server: it is a static site that runs from GitHub Pages and keeps
 working offline once opened. All data stays on the device until you export it.
@@ -17,7 +18,47 @@ working offline once opened. All data stays on the device until you export it.
 Pages on a private repository needs a paid GitHub plan; on a public repo it is free.
 HTTPS is required for GPS and offline use, and Pages provides it.
 
-## In the field
+## Survey types
+
+Each survey has a type, chosen when you create it and changeable under **Menu → Survey type**.
+The GPS track, notes, photos and exports are the same in all of them.
+
+| Type | Plan | Guidance | Quick button |
+|---|---|---|---|
+| **Gas walkover (ISM)** | Boundary filled with walk transects, or any route | Follows the route start to finish | **Mark** – numbered pin |
+| **Contaminated land sampling** | Sampling points: square, triangular or herringbone grid, random, and/or targeted | Arrow and distance to the next point | **Sample** – sample log |
+| **General field recording** | Optional route or points | Whichever exists | **Mark** |
+
+### Contaminated land sampling
+
+Built around the sampling designs and field records in the NZ Ministry for the Environment
+*Contaminated Land Management Guidelines No. 5* (targeted and systematic patterns, grid sizing
+for hotspot detection, duplicates and blanks, sample labelling and soil logging).
+
+- **Plan → Points**: draw the boundary, pick a pattern and spacing, **Generate points**. The app
+  shows the smallest circular hotspot a square grid of that spacing finds with 95 % confidence
+  (grid = 0.59 × hotspot radius) and the point count. That figure is an aid only: the guideline is
+  explicit that grid size needs site-specific justification, not just the formula.
+- Tap the map for **targeted** points at known sources. Tick **Keep existing** and redraw the
+  boundary round part of the site to layer a finer grid there (multiple grids / stratified areas).
+  **Random start** offsets the grid origin randomly. Points can also be imported from GeoJSON, KML or GPX.
+- In the field the arrow leads to the next point. **Sample** opens the log for the point you are at:
+  depths, sample type (primary, duplicate, triplicate, composite sub-sample, rinsate/trip blank),
+  sample ID, method, material and soil type, colour, moisture, odour, evidence of contamination,
+  PID reading, analysis requested, containers, sampler, weather, notes and photos.
+  **Save + next depth** logs another depth at the same location. Duplicates and blanks get neutral
+  IDs (QC01, RB01, TB01) so the lab cannot pair them with the primary.
+- The position actually sampled is recorded and the planned position is kept, so the register shows
+  how far each sample was from plan. Tap a point to navigate to it, mark it **not sampled** with a
+  reason, move it, or add **step-out points** around it. **Sample** away from any planned point
+  offers to log an unplanned location.
+- Export adds `samples.csv` / `samples.geojson` (the sample register) and the points with their
+  status in `plan.geojson`.
+
+It records what was done; it does not write the sampling and analysis plan, choose analytes or
+replace chain-of-custody paperwork, though the register has what that paperwork asks for.
+
+## In the field (gas walkover)
 
 | Step | Where | What it does |
 |---|---|---|

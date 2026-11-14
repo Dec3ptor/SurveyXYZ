@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { RouteFollower } from '../js/geo.js';
+import { RouteFollower, samplePoints, pointInPolygon } from '../js/geo.js';
+import { hotspotDiameter } from '../js/modes.js';
+import { samplesCSV, samplesGeoJSON, obsCSV } from '../js/exporters.js';
 import { haversine, bearing, LocalFrame, generateTransects, nearestOnRoute, polygonArea, pathLength, Coverage, angDiff } from '../js/geo.js';
 import { FusionFilter, StepDetector } from '../js/fusion.js';
 import { parseCSV, parseInstrumentTime, detectDateOrder, positionAt, mergeReadings, mergedTable, guessTimeColumns, detectDelimiter } from '../js/merge.js';
@@ -225,4 +227,48 @@ test('route follower keeps order and does not hop to the next transect', () => {
   f.update([5, 20]); // too far ahead along the route to be believable in one step
   assert.equal(f.s, before);
   assert.ok(Math.abs(f.resync([0.5, 20]).s - 20) < 1e-9);
+});
+
+test('sampling patterns', () => {
+  const sq = [[0, 0], [100, 0], [100, 50], [0, 50]].map(([x, y]) => F.toLL(x, y));
+  const xy = (pts) => pts.map((p) => F.toXY(p[0], p[1]));
+  const square = xy(samplePoints(sq, { pattern: 'square', spacing: 10, bearing: 0 }));
+  assert.equal(square.length, 50); // 5000 m2 / 10^2, as in the guideline's table B1
+  assert.ok(Math.abs(Math.hypot(square[0][0] - square[1][0], square[0][1] - square[1][1]) - 10) < 1e-3);
+  assert.ok(Math.abs(Math.abs(square[9][1] - square[10][1]) - 10) < 1e-3 && Math.abs(square[9][0] - square[10][0]) < 1e-3, 'serpentine row order');
+  const tri = xy(samplePoints(sq, { pattern: 'triangular', spacing: 10, bearing: 0 }));
+  assert.ok(tri.length >= 54 && tri.length <= 64, 'triangular ' + tri.length);
+  const dmin = (pts) => Math.min(...pts.flatMap((p, i) => pts.slice(i + 1).map((q) => Math.hypot(p[0] - q[0], p[1] - q[1]))));
+  assert.ok(Math.abs(dmin(tri) - 10) < 1e-3);
+  const her = xy(samplePoints(sq, { pattern: 'herringbone', spacing: 10, bearing: 0 }));
+  assert.ok(her.length >= 45 && her.length <= 55, 'herringbone ' + her.length);
+  const g = rng(7); const u = () => Math.abs(g()) % 1;
+  const rnd = xy(samplePoints(sq, { pattern: 'random', count: 25 }, u));
+  assert.equal(rnd.length, 25);
+  for (const set of [square, tri, her, rnd]) for (const p of set) assert.ok(pointInPolygon([[0, 0], [100, 0], [100, 50], [0, 50]], p));
+  const rot = samplePoints(sq, { pattern: 'square', spacing: 10, bearing: 30, randomStart: true }, u);
+  assert.ok(rot.length >= 44 && rot.length <= 56, 'rotated ' + rot.length);
+  assert.ok(Math.abs(hotspotDiameter(10) - 11.8) < 1e-9);
+});
+
+test('sample register export and point import', () => {
+  const survey = { name: 'Site', created: 1e12, plan: { boundary: [], route: [], points: [{ id: 'S01', lat: 1, lon: 2, kind: 'grid', status: 'done' }] } };
+  const obs = [
+    { kind: 'sample', num: 1, t: 1e12, lat: 1.00001, lon: 2, acc: 3, pointId: 'S01', note: 'ok', photoIds: [], data: { sampleId: 'S01_0.1', type: 'Primary', depthFrom: 0.1, depthTo: 0.2, soil: ['Clay', 'Silt'], analytes: ['TPH', 'PAH'] } },
+    { num: 2, t: 1e12, lat: 1, lon: 2, category: 'Odour', note: '', photoIds: [] },
+  ];
+  const rows = parseCSV(samplesCSV(survey, obs));
+  assert.equal(rows.length, 2);
+  const col = (n) => rows[1][rows[0].indexOf(n)];
+  assert.equal(col('sample_id'), 'S01_0.1');
+  assert.equal(col('soil_type'), 'Clay; Silt');
+  assert.equal(col('offset_from_planned_m'), '1.1');
+  assert.equal(samplesGeoJSON(survey, obs).features[0].properties.analytes, 'TPH; PAH');
+  assert.equal(parseCSV(obsCSV(obs)).length, 2); // the note only
+  const back = parsePlanFile(JSON.stringify(planGeoJSON(survey)));
+  assert.deepEqual(back.points, [{ lat: 1, lon: 2, id: 'S01' }]);
+  const g = parsePlanFile('<gpx><wpt lat="1" lon="2"><name>BH1</name></wpt></gpx>');
+  assert.deepEqual(g.points, [{ lat: 1, lon: 2, id: 'BH1' }]);
+  const k = parsePlanFile('<kml><Placemark><name>TP3</name><Point><coordinates>2,1,0</coordinates></Point></Placemark></kml>');
+  assert.deepEqual(k.points, [{ lat: 1, lon: 2, id: 'TP3' }]);
 });

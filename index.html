@@ -43,6 +43,7 @@
       <div class="seg">
         <button data-shape="boundary" class="on">Boundary</button>
         <button data-shape="route">Route</button>
+        <button data-shape="points">Points</button>
       </div>
       <button id="planDone" class="primary">Done</button>
     </div>
@@ -53,8 +54,12 @@
       <button id="planImport">Import</button>
     </div>
     <div class="row wrap" id="planGen">
-      <label>Spacing <input id="planSpacing" type="number" inputmode="decimal" min="1" step="0.5"> m</label>
-      <label>Bearing <input id="planBearing" type="number" inputmode="numeric" min="0" max="359" step="1" placeholder="auto">°</label>
+      <select id="planPattern" aria-label="Sampling pattern"></select>
+      <label id="lblSpacing">Spacing <input id="planSpacing" type="number" inputmode="decimal" min="1" step="0.5"> m</label>
+      <label id="lblCount">Points <input id="planCount" type="number" inputmode="numeric" min="1" step="1" value="10"></label>
+      <label id="lblBearing">Bearing <input id="planBearing" type="number" inputmode="numeric" min="0" max="359" step="1" placeholder="auto">°</label>
+      <label id="lblKeep" class="check"><input id="planKeep" type="checkbox"> Keep existing</label>
+      <label id="lblRandom" class="check" hidden><input id="planRandom" type="checkbox"> Random start</label>
       <button id="planGenerate" class="primary">Fill with transects</button>
     </div>
     <div id="planInfo">Tap the map to add boundary corners.</div>

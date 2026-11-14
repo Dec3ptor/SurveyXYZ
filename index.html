@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#12343b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="SurveyXYZ">
+<title>SurveyXYZ</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div id="map"></div>
+
+<div id="top">
+  <div id="status">
+    <button id="surveyBtn" class="chip" title="Surveys"><span id="surveyName">…</span> ▾</button>
+    <span id="gpsChip" class="chip bad">GPS…</span>
+    <span id="motionChip" class="chip" hidden></span>
+    <span id="recChip" class="chip rec" hidden></span>
+  </div>
+
+  <div id="guide" hidden>
+    <div id="guideMain">
+      <div id="guideText">—</div>
+      <div id="guideBar"><div id="guideTol"></div><div id="guideMid"></div><div id="guideDot"></div></div>
+    </div>
+    <div id="guideSub"></div>
+  </div>
+
+  <div id="planbar" hidden>
+    <div class="row">
+      <div class="seg">
+        <button data-shape="boundary" class="on">Boundary</button>
+        <button data-shape="route">Route</button>
+      </div>
+      <button id="planDone" class="primary">Done</button>
+    </div>
+    <div class="row wrap">
+      <button id="planGps">+ Here</button>
+      <button id="planUndo">Undo</button>
+      <button id="planClear">Clear</button>
+      <button id="planImport">Import</button>
+    </div>
+    <div class="row wrap" id="planGen">
+      <label>Spacing <input id="planSpacing" type="number" inputmode="decimal" min="1" step="0.5"> m</label>
+      <label>Bearing <input id="planBearing" type="number" inputmode="numeric" min="0" max="359" step="1" placeholder="auto">°</label>
+      <button id="planGenerate" class="primary">Fill with transects</button>
+    </div>
+    <div id="planInfo">Tap the map to add boundary corners.</div>
+  </div>
+</div>
+
+<div id="crosshair" hidden></div>
+<button id="followBtn" class="fab on" title="Follow my position" aria-label="Follow my position">
+  <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+</button>
+
+<nav id="toolbar">
+  <button id="bMenu"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg><span>Menu</span></button>
+  <button id="bPlan"><svg viewBox="0 0 24 24"><path d="M4 5v14M4 5h5v14h5V5h5v14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Plan</span></button>
+  <button id="bRec" class="recbtn"><i></i><span>Record</span></button>
+  <button id="bMark"><svg viewBox="0 0 24 24"><path d="M12 22s7-7.2 7-12a7 7 0 0 0-14 0c0 4.800 7 12 7 12z" fill="none" stroke="currentColor" stroke-width="2.2"/><circle cx="12" cy="10" r="2.4"/></svg><span>Mark</span></button>
+  <button id="bNote"><svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><circle cx="12" cy="13" r="3.2" fill="none" stroke="currentColor" stroke-width="2.2"/></svg><span>Note</span></button>
+</nav>
+
+<section id="sheet" hidden>
+  <header><h2 id="sheetTitle"></h2><button id="sheetClose" aria-label="Close">✕</button></header>
+  <div id="sheetBody"></div>
+</section>
+<div id="toast" hidden></div>
+<input id="fileInput" type="file" hidden>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

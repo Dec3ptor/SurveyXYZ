@@ -2,7 +2,7 @@
 import * as db from './db.js';
 import { FusionFilter } from './fusion.js';
 import { Sensors } from './sensors.js';
-import { haversine, bearing, angDiff, cardinal, frameFor, nearestOnRoute, generateTransects, longestEdgeBearing, polygonArea, pathLength, Coverage } from './geo.js';
+import { haversine, bearing, angDiff, cardinal, frameFor, RouteFollower, generateTransects, longestEdgeBearing, polygonArea, pathLength, Coverage } from './geo.js';
 import * as ex from './exporters.js';
 import { makeZip } from './zip.js';
 import { openMerge } from './mergeui.js';
@@ -26,10 +26,10 @@ export const S = {
   fix: null, est: null, lastFixWall: 0, lastDrSteps: 0,
   follow: true, planShape: null,
   route: null, // {frame, xy}
-  coverage: null, hint: -1, offCount: 0, lastAlert: 0,
+  coverage: null, follower: null, target: null, offCount: 0, lastAlert: 0,
 };
 const filter = new FusionFilter({ mode: settings.filterMode, maxAcc: settings.maxAcc });
-const sensors = new Sensors(filter, { onFix, onError: onGpsError });
+const sensors = new Sensors(filter, { onFix, onError: onGpsError, onCompass: () => requestAnimationFrame(turnArrow) });
 
 // ---------- map ----------
 const map = L.map('map', { zoomControl: false, preferCanvas: true, maxZoom: 22, attributionControl: true }).setView([0, 0], 2);
@@ -52,6 +52,7 @@ const layers = {
 export { map, layers };
 const accCircle = L.circle([0, 0], { radius: 1, color: '#1565c0', weight: 1, fillOpacity: 0.12, interactive: false });
 const meMarker = L.marker([0, 0], { icon: L.divIcon({ className: '', html: '<div class="me"><i hidden></i></div>', iconSize: [26, 26], iconAnchor: [13, 13] }), interactive: false, zIndexOffset: 1000 });
+const targetLine = L.polyline([], { color: '#ff00c8', weight: 3, dashArray: '4 6', interactive: false });
 let trackLine = null, rawLine = null;
 
 // ---------- small UI helpers ----------
@@ -127,6 +128,7 @@ const fmtDur = (ms) => {
 async function newSurvey(name, copyPlanFrom) {
   const survey = {
     id: db.uid(), name: name || 'Survey ' + ex.localStamp(Date.now()).slice(0, 16), created: Date.now(), clockOffsetS: null, obsCount: 0,
+    progress: 0,
     plan: copyPlanFrom ? JSON.parse(JSON.stringify(copyPlanFrom.plan)) : { boundary: [], route: [], spacing: settings.spacing, bearing: null },
   };
   await db.put('surveys', survey);
@@ -174,10 +176,11 @@ function drawPlan() {
 }
 function rebuildRoute(replay) {
   const route = S.survey.plan.route || [];
-  S.hint = -1;
+  S.follower = null; S.target = null; targetLine.remove();
   if (route.length < 2) { S.route = null; S.coverage = null; layers.covered.clearLayers(); $('guide').hidden = true; return; }
   const frame = frameFor(route);
   S.route = { frame, xy: route.map((p) => frame.toXY(p[0], p[1])) };
+  S.follower = new RouteFollower(S.route.xy, S.survey.progress);
   S.coverage = new Coverage(route, 2);
   if (replay) for (const p of S.points) S.coverage.mark(p.lat, p.lon, settings.tol);
   drawCovered();
@@ -277,44 +280,117 @@ setInterval(() => {
 }, 2000);
 
 // ---------- guidance ----------
+// The route is followed in order from start to finish. The dial arrow points
+// at a spot a few metres further along the route from where you have got to
+// (or straight at the rejoin point when you are well off it), turned by the
+// compass so it points the right way in the real world.
 function guide(est) {
-  const g = $('guide');
-  if (!S.route || S.planShape) { g.hidden = true; return null; }
+  const g = $('guide'), f = S.follower;
+  if (!f || S.planShape) { g.hidden = true; targetLine.remove(); return null; }
   const p = S.route.frame.toXY(est.lat, est.lon);
-  const n = nearestOnRoute(S.route.xy, p, S.hint);
-  if (!n) { g.hidden = true; return null; }
-  S.hint = n.idx;
-  g.hidden = false;
   const tol = settings.tol;
+  const atStart = f.s < 0.5;
+  const n = f.update(p, S.recording, Math.max(5, 2 * tol));
+  if (!n) { g.hidden = true; return null; }
+  g.hidden = false;
   const pct = S.coverage ? Math.round(S.coverage.fraction * 100) : 0;
-  if (n.dist > Math.max(25, 6 * tol)) {
-    const [la, lo] = S.route.frame.toLL(n.px, n.py);
-    const b = bearing(est.lat, est.lon, la, lo);
-    g.className = 'far';
-    $('guideText').textContent = fmtDist(n.dist);
-    $('guideDot').style.left = '50%';
-    $('guideSub').textContent = `Path is ${fmtDist(n.dist)} to the ${cardinal(b)} (${Math.round(b)}°) · ${pct}% walked`;
-    S.offCount = 0;
-    return n.dist;
+  const leg = `Leg ${n.idx + 1}/${n.legs}`;
+  const done = f.total - n.s < 1.5 && n.dist <= 2 * tol;
+  const far = n.dist > Math.max(15, 4 * tol);
+  // Where to head: ahead along the route when near it, the rejoin point when far.
+  const tp = f.pointAt(far ? f.s : n.s + Math.max(6, 2 * tol));
+  const [tla, tlo] = S.route.frame.toLL(tp.x, tp.y);
+  S.target = done ? null : { bearing: bearing(est.lat, est.lon, tla, tlo) };
+  if (done) targetLine.remove(); else targetLine.setLatLngs([[est.lat, est.lon], [tla, tlo]]).addTo(layers.me);
+
+  const a = Math.abs(n.xte), off = n.dist > tol;
+  let cls = '', text, dist, label, sub;
+  if (done) { text = 'Route finished'; dist = '✓'; label = ''; sub = `${pct}% walked`; }
+  else if (far) {
+    cls = 'far'; dist = fmtDist(n.dist); label = atStart ? 'to start' : 'to path';
+    text = atStart ? 'Go to start' : 'Return to path';
+    sub = `${atStart ? 'Start' : 'Where you left off'} is ${cardinal(S.target.bearing)} (${Math.round(S.target.bearing)}°) · ${pct}% walked`;
+  } else if (off) {
+    cls = n.dist <= 2 * tol ? 'warn' : 'bad';
+    dist = n.dist.toFixed(1) + ' m'; label = 'to path';
+    text = n.xte > 0 ? `← ${a.toFixed(1)} m left` : `${a.toFixed(1)} m right →`;
+    sub = `${leg} · ${fmtDist(n.toTurn)} to turn · ${pct}% walked`;
+  } else {
+    const last = n.idx === n.legs - 1;
+    dist = fmtDist(n.toTurn); label = last ? 'to finish' : 'to turn';
+    text = a <= tol * 0.35 ? 'On path' : n.xte > 0 ? `On path · ${a.toFixed(1)} m R` : `On path · ${a.toFixed(1)} m L`;
+    sub = `${leg} · ${fmtDist(f.total - n.s)} left · ${pct}% walked`;
   }
-  // Left/right is relative to the way you are actually walking the line.
-  let xte = n.xte;
-  const h = filter.travelHeading;
-  if (h != null && Math.abs(angDiff(h, n.segBearing)) > 90) xte = -xte;
-  const a = Math.abs(xte);
-  g.className = a <= tol ? '' : a <= 2 * tol ? 'warn' : 'bad';
-  $('guideText').textContent = a <= tol * 0.35 ? 'On path' : xte > 0 ? `← ${a.toFixed(1)} m` : `${a.toFixed(1)} m →`;
-  $('guideDot').style.left = 50 + Math.max(-48, Math.min(48, (xte / (3 * tol)) * 50)) + '%';
-  $('guideSub').textContent = `Leg ${n.idx + 1}/${S.route.xy.length - 1} · ${fmtDist(n.toEnd)} to turn · ${pct}% walked` + (a > tol ? ` · steer ${xte > 0 ? 'left' : 'right'}` : '');
-  if (S.recording && est.moving && a > tol) {
+  if (!S.recording && !done) sub += ' · press Record to start following';
+  g.className = cls;
+  $('guideText').textContent = text;
+  $('dialDist').textContent = dist;
+  $('dialLabel').textContent = label;
+  $('guideSub').textContent = sub;
+  $('guideDot').style.left = 50 + Math.max(-48, Math.min(48, (n.xte / (3 * tol)) * 50)) + '%';
+  $('guideBar').style.visibility = far || done ? 'hidden' : '';
+  turnArrow();
+
+  if (S.recording && est.moving && off && !done) {
     if (++S.offCount >= 3 && Date.now() - S.lastAlert > 8000) {
       S.lastAlert = Date.now();
       if (settings.vibrate && navigator.vibrate) navigator.vibrate([200, 100, 200]);
       if (settings.sound) beep();
     }
   } else S.offCount = 0;
+  if (S.recording && Math.abs((S.survey.progress || 0) - f.s) > 20) { S.survey.progress = f.s; saveSurvey(); }
   return n.xte;
 }
+
+/** Rotate the dial arrow. Runs on every compass event so it stays live as you turn. */
+let arrowNote = '';
+function turnArrow() {
+  const el = $('dialArrow');
+  if (!S.target) { el.hidden = true; return; }
+  el.hidden = false;
+  let h = sensors.screenHeading, note = '';
+  if (h == null) {
+    h = filter.travelHeading;
+    note = h == null ? 'No compass: arrow is north-up' : 'No compass: arrow is relative to your walking direction';
+    if (h == null) h = 0;
+  }
+  // Keep the rotation continuous so the CSS transition takes the short way round.
+  const want = S.target.bearing - h;
+  turnArrow.rot = (turnArrow.rot ?? want) + angDiff(want, turnArrow.rot ?? want);
+  el.style.transform = `rotate(${turnArrow.rot}deg)`;
+  if (note !== arrowNote) { arrowNote = note; $('dial').title = note; }
+  $('dial').style.borderStyle = note ? 'dashed' : 'solid';
+}
+
+$('guide').onclick = () => {
+  const f = S.follower;
+  if (!f) return;
+  const b = openSheet('Path guidance', `
+    <p>The route is followed in order from the green start dot to the red finish dot. You are ${fmtDist(f.s)} along a ${fmtDist(f.total)} route.</p>
+    <p class="muted">The arrow shows which way to face and walk; the number in it is the distance to the path when you are off it, or to the next turn when you are on it. A dashed dial means the compass is not available${arrowNote ? ` (${arrowNote.toLowerCase()})` : ''}. If the arrow seems wrong, wave the phone in a figure-of-eight to recalibrate the compass and keep it away from metal.</p>
+    <div class="list">
+      <button class="btn primary" data-a="near">Continue from the nearest point<small>Use after skipping a section or walking round an obstacle</small></button>
+      <button class="btn" data-a="start">Restart from the beginning</button>
+      <button class="btn" data-a="reverse">Reverse the route<small>Walk it from the other end</small></button>
+    </div>`);
+  b.querySelector('.list').onclick = (e) => {
+    const a = e.target.closest('button')?.dataset.a;
+    if (!a) return;
+    if (a === 'near') {
+      if (!S.est) return toast('No GPS fix yet.');
+      f.resync(S.route.frame.toXY(S.est.lat, S.est.lon));
+    }
+    if (a === 'start') f.s = 0;
+    if (a === 'reverse') {
+      S.survey.plan.route.reverse();
+      S.survey.progress = 0;
+      drawPlan(); rebuildRoute(true);
+    } else S.survey.progress = f.s;
+    saveSurvey(); closeSheet();
+    if (S.est) guide(S.est);
+    toast(a === 'near' ? `Continuing from ${fmtDist(S.follower.s)} along the route.` : a === 'start' ? 'Back to the start of the route.' : 'Route reversed.');
+  };
+};
 
 // ---------- recording ----------
 async function startRecording() {
@@ -337,6 +413,7 @@ async function stopRecording() {
   $('bRec').classList.remove('on');
   $('bRec').lastElementChild.textContent = 'Record';
   sensors.keepAwake(false);
+  if (S.follower) { S.survey.progress = S.follower.s; saveSurvey(); }
   drawCovered(); updateRecChip();
 }
 $('bRec').onclick = () => {
@@ -365,9 +442,11 @@ $('followBtn').onclick = () => {
 
 // ---------- plan editing ----------
 const planPts = () => S.survey.plan[S.planShape];
+let planBefore = '';
 function enterPlan() {
   if (S.recording) { toast('Stop recording before editing the plan.'); return; }
   closeSheet();
+  planBefore = JSON.stringify(S.survey.plan.route);
   S.planShape = S.survey.plan.boundary?.length || !S.survey.plan.route?.length ? 'boundary' : 'route';
   $('planbar').hidden = false; $('guide').hidden = true; $('crosshair').hidden = false;
   $('bPlan').classList.add('on');
@@ -380,7 +459,9 @@ function exitPlan() {
   $('planbar').hidden = true; $('crosshair').hidden = true;
   $('bPlan').classList.remove('on');
   layers.edit.clearLayers();
+  if (JSON.stringify(S.survey.plan.route) !== planBefore) S.survey.progress = 0;
   saveSurvey(); rebuildRoute(true);
+  if (S.est) guide(S.est);
 }
 function refreshPlanEdit() {
   document.querySelectorAll('#planbar .seg button').forEach((b) => b.classList.toggle('on', b.dataset.shape === S.planShape));
@@ -808,7 +889,7 @@ function openHelp() {
     <h3>2 · Sync the instrument clock</h3>
     <p><b>Menu → Instrument clock sync</b> before you start. This is what makes the later merge line up.</p>
     <h3>3 · Record</h3>
-    <p>Press <b>Record</b> and walk. The banner shows how far you are off the line and which way to steer; walked sections turn green. <b>Keep this app open with the screen on</b> — phones stop giving GPS to web apps when locked or in the background. Carry the phone the same way throughout (in hand or a chest pocket works best).</p>
+    <p>Press <b>Record</b> and walk. The route is followed in order from the green dot to the red dot. The arrow shows which way to face and walk (hold the phone flat, pointing ahead), with the distance back to the path when you are off it or to the next turn when you are on it; walked sections turn green. Tap the banner to continue from the nearest point, restart, or reverse the route. <b>Keep this app open with the screen on</b> — phones stop giving GPS to web apps when locked or in the background. Carry the phone the same way throughout (in hand or a chest pocket works best).</p>
     <h3>4 · Mark and note</h3>
     <p><b>Mark</b> drops a numbered pin instantly. <b>Note</b> captures the position first, then lets you add photos, a category, a reading and text. To record something you can see but not reach, pan the map and use <b>Move to map crosshair</b>.</p>
     <h3>5 · Export and merge</h3>
@@ -822,6 +903,8 @@ function openHelp() {
 if ('serviceWorker' in navigator && location.protocol === 'https:' || location.hostname === 'localhost') navigator.serviceWorker?.register('sw.js').catch(() => {});
 loadSurvey(localStorage.getItem('sxyz.current')).then(() => {
   sensors.startGps();
+  sensors.startMotion(); // compass for the guidance arrow
+  window.addEventListener('pointerdown', () => { if (sensors.compass == null) sensors.startMotion(); }, { once: true });
   if (!localStorage.getItem('sxyz.seen')) { localStorage.setItem('sxyz.seen', '1'); openHelp(); }
 });
 // Debug/testing handle.

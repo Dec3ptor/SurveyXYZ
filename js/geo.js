@@ -205,3 +205,60 @@ export class Coverage {
     return out.filter((r) => r.length > 1);
   }
 }
+
+/**
+ * Follows a route in order, start to finish. Progress `s` is metres along the
+ * route. Each update only looks a short way behind and ahead of the current
+ * progress, so guidance cannot hop to a neighbouring transect or skip ahead.
+ */
+export class RouteFollower {
+  constructor(xy, s = 0) {
+    this.xy = xy;
+    this.cum = [0];
+    for (let i = 1; i < xy.length; i++) this.cum.push(this.cum[i - 1] + Math.hypot(xy[i][0] - xy[i - 1][0], xy[i][1] - xy[i - 1][1]));
+    this.total = this.cum[this.cum.length - 1];
+    this.s = Math.max(0, Math.min(this.total, s || 0));
+  }
+  /** Point at distance s along the route: {x, y, idx}. */
+  pointAt(s) {
+    s = Math.max(0, Math.min(this.total, s));
+    let i = 0;
+    while (i < this.xy.length - 2 && this.cum[i + 1] < s) i++;
+    const len = this.cum[i + 1] - this.cum[i];
+    const t = len ? (s - this.cum[i]) / len : 0;
+    return { x: this.xy[i][0] + t * (this.xy[i + 1][0] - this.xy[i][0]), y: this.xy[i][1] + t * (this.xy[i + 1][1] - this.xy[i][1]), idx: i };
+  }
+  /** Nearest point within [from, to] metres along the route. xte > 0 = right of travel. */
+  project(p, from = 0, to = this.total) {
+    let best = null;
+    for (let i = 0; i < this.xy.length - 1; i++) {
+      const len = this.cum[i + 1] - this.cum[i];
+      if (!len || this.cum[i + 1] < from || this.cum[i] > to) continue;
+      const [ax, ay] = this.xy[i], dx = (this.xy[i + 1][0] - ax) / len, dy = (this.xy[i + 1][1] - ay) / len;
+      let a = (p[0] - ax) * dx + (p[1] - ay) * dy;
+      a = Math.max(Math.max(0, from - this.cum[i]), Math.min(Math.min(len, to - this.cum[i]), a));
+      const px = ax + a * dx, py = ay + a * dy;
+      const dist = Math.hypot(p[0] - px, p[1] - py);
+      if (!best || dist < best.dist) {
+        best = { s: this.cum[i] + a, dist, idx: i, px, py, xte: -(dx * (p[1] - ay) - dy * (p[0] - ax)), toTurn: len - a, legs: this.xy.length - 1 };
+      }
+    }
+    return best;
+  }
+  /**
+   * Project near current progress. Progress only moves when you are within
+   * `corridor` metres of the route, so walking beside or towards the path
+   * cannot drag progress along with you.
+   */
+  update(p, commit = true, corridor = 6, back = 6, ahead = 25) {
+    const r = this.project(p, this.s - back, this.s + ahead);
+    if (r && commit && r.dist <= corridor) this.s = r.s;
+    return r;
+  }
+  /** Jump progress to the nearest point anywhere on the route. */
+  resync(p) {
+    const r = this.project(p);
+    if (r) this.s = r.s;
+    return r;
+  }
+}

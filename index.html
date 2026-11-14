@@ -25,13 +25,18 @@
     <span id="recChip" class="chip rec" hidden></span>
   </div>
 
-  <div id="guide" hidden>
-    <div id="guideMain">
+  <button id="guide" hidden title="Path guidance options">
+    <div id="dial">
+      <div id="dialArrow"><svg viewBox="0 0 100 100"><path d="M50 0 L63 21 H37 Z"/></svg></div>
+      <div id="dialDist">–</div>
+      <div id="dialLabel"></div>
+    </div>
+    <div id="guideInfo">
       <div id="guideText">—</div>
       <div id="guideBar"><div id="guideTol"></div><div id="guideMid"></div><div id="guideDot"></div></div>
+      <div id="guideSub"></div>
     </div>
-    <div id="guideSub"></div>
-  </div>
+  </button>
 
   <div id="planbar" hidden>
     <div class="row">

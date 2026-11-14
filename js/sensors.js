@@ -3,11 +3,12 @@
 import { StepDetector } from './fusion.js';
 
 export class Sensors {
-  constructor(filter, { onFix, onError, onStep }) {
+  constructor(filter, { onFix, onError, onStep, onCompass }) {
     this.filter = filter;
     this.onFix = onFix; this.onError = onError; this.onStep = onStep || (() => {});
     this.steps = new StepDetector();
-    this.compass = null;
+    this.compass = null; this.compassT = 0;
+    this.onCompass = onCompass || (() => {});
     this.motionOk = false;
     this.watchId = null;
     this.wake = null;
@@ -51,23 +52,33 @@ export class Sensors {
     this.onFix(fix, est, { hasMotion, compass: this.compass });
   }
 
-  /** Must be called from a user gesture (iOS asks for permission here). */
+  /** Direction the top of the screen is facing, or null if the compass is silent. */
+  get screenHeading() {
+    if (this.compass == null || performance.now() - this.compassT > 3000) return null;
+    return (this.compass + (screen.orientation?.angle || 0) + 360) % 360;
+  }
+
+  /**
+   * Start accelerometer + compass. Some browsers only grant these from a user
+   * gesture (iOS always; newer Chrome sometimes), so this is tried at startup
+   * and again on the first tap and on Record. Safe to call repeatedly.
+   */
   async startMotion() {
-    try {
-      if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission) {
-        if ((await DeviceMotionEvent.requestPermission()) !== 'granted') return false;
-      }
-      if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) {
-        await DeviceOrientationEvent.requestPermission().catch(() => {});
-      }
-    } catch { return false; }
+    const ask = async (E) => {
+      try {
+        if (typeof E === 'undefined') return false;
+        return !E.requestPermission || (await E.requestPermission()) === 'granted';
+      } catch { return false; }
+    };
+    const motion = await ask(window.DeviceMotionEvent);
+    await ask(window.DeviceOrientationEvent);
     window.removeEventListener('devicemotion', this._motion);
     window.addEventListener('devicemotion', this._motion);
     for (const ev of ['deviceorientationabsolute', 'deviceorientation']) {
       window.removeEventListener(ev, this._orient);
       window.addEventListener(ev, this._orient);
     }
-    return true;
+    return motion;
   }
 
   handleMotion(e) {
@@ -86,8 +97,9 @@ export class Sensors {
     if (Number.isFinite(e.webkitCompassHeading)) h = e.webkitCompassHeading; // iOS
     else if ((e.absolute || e.type === 'deviceorientationabsolute') && Number.isFinite(e.alpha)) h = (360 - e.alpha) % 360;
     if (h == null) return;
-    this.compass = h;
+    this.compass = h; this.compassT = performance.now();
     this.filter.setCompass(h);
+    this.onCompass(h);
   }
 
   /** Keep the screen on: browsers stop delivering GPS when the screen locks. */

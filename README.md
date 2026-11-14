@@ -23,7 +23,7 @@ HTTPS is required for GPS and offline use, and Pages provides it.
 |---|---|---|
 | Plan | **Plan** | Tap boundary corners (or walk the edge with **+ Here**), choose spacing and bearing, **Fill with transects**. Or tap out any route, or import GeoJSON / KML / GPX. |
 | Clock | **Menu → Instrument clock sync** | Records how far the gas monitor's clock is from the phone's, so the merge lines up. |
-| Walk | **Record** | Banner shows metres off the line and which way to steer; beeps/vibrates when outside tolerance; walked sections turn green with a % complete. |
+| Walk | **Record** | The route is followed in order, start to finish. A compass arrow shows which way to face and walk, with the distance to the path (when off it) or to the next turn (when on it); beeps/vibrates when outside tolerance; walked sections turn green with a % complete. Tap the banner to continue from the nearest point, restart, or reverse the route. |
 | Observe | **Mark** / **Note** | One-tap numbered pin, or a note with photos, category, manual reading and text. Position is taken when you press the button. |
 | Offline map | **Menu → Settings** | Frame the site and **Save this map area** while you still have signal. |
 

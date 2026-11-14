@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { RouteFollower } from '../js/geo.js';
 import { haversine, bearing, LocalFrame, generateTransects, nearestOnRoute, polygonArea, pathLength, Coverage, angDiff } from '../js/geo.js';
 import { FusionFilter, StepDetector } from '../js/fusion.js';
 import { parseCSV, parseInstrumentTime, detectDateOrder, positionAt, mergeReadings, mergedTable, guessTimeColumns, detectDelimiter } from '../js/merge.js';
@@ -199,4 +200,29 @@ test('exports and plan import round-trip', async () => {
   assert.equal(buf[0], 0x50); assert.equal(buf[1], 0x4b);
   const { writeFileSync } = await import('node:fs');
   writeFileSync(process.env.ZIP_OUT || '/dev/null', buf);
+});
+
+test('route follower keeps order and does not hop to the next transect', () => {
+  // two 100 m transects 5 m apart joined at the top
+  const f = new RouteFollower([[0, 0], [0, 100], [5, 100], [5, 0]]);
+  assert.equal(f.total, 205);
+  let r = f.update([20, 30]); // walking towards the path from the side: progress must not creep
+  assert.equal(f.s, 0);
+  for (let y = 0; y <= 50; y += 5) r = f.update([0, y]);
+  r = f.update([3.5, 50]); // GPS wobble puts us nearer the return leg
+  assert.equal(r.idx, 0);
+  assert.ok(Math.abs(r.s - 50) < 1e-9 && Math.abs(r.xte - 3.5) < 1e-9);
+  for (let y = 50; y <= 100; y += 5) r = f.update([0, y]);
+  for (let y = 100; y >= 60; y -= 5) r = f.update([5, y]);
+  assert.equal(r.idx, 2);
+  assert.ok(Math.abs(f.s - 145) < 1e-9);
+  assert.ok(Math.abs(r.toTurn - 60) < 1e-9);
+  const before = f.s;
+  f.update([0, 20], false); // not committed
+  assert.equal(f.s, before);
+  const t = f.pointAt(f.s + 6);
+  assert.ok(Math.abs(t.x - 5) < 1e-9 && Math.abs(t.y - 54) < 1e-9);
+  f.update([5, 20]); // too far ahead along the route to be believable in one step
+  assert.equal(f.s, before);
+  assert.ok(Math.abs(f.resync([0.5, 20]).s - 20) < 1e-9);
 });

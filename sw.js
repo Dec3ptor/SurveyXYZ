@@ -1,5 +1,5 @@
 // Service worker: makes the app and viewed map tiles work with no signal.
-const SHELL = 'sxyz-shell-v1';
+const SHELL = 'sxyz-shell-v2';
 const TILES = 'sxyz-tiles';
 const FILES = ['./', 'index.html', 'manifest.webmanifest', 'css/app.css',
   'js/app.js', 'js/db.js', 'js/geo.js', 'js/fusion.js', 'js/sensors.js', 'js/merge.js', 'js/mergeui.js', 'js/exporters.js', 'js/zip.js',

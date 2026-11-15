@@ -2,7 +2,7 @@
 import * as db from './db.js';
 import { FusionFilter } from './fusion.js';
 import { Sensors } from './sensors.js';
-import { haversine, bearing, angDiff, cardinal, frameFor, RouteFollower, generateTransects, samplePoints, longestEdgeBearing, polygonArea, pathLength, Coverage } from './geo.js';
+import { haversine, bearing, angDiff, cardinal, frameFor, RouteFollower, buildPlan, insideRing, longestEdgeBearing, polygonArea, pathLength, Coverage } from './geo.js';
 import * as ex from './exporters.js';
 import { makeZip } from './zip.js';
 import { openMerge } from './mergeui.js';
@@ -36,6 +36,8 @@ const filter = new FusionFilter({ mode: settings.filterMode, maxAcc: settings.ma
 const sensors = new Sensors(filter, { onFix, onError: onGpsError, onCompass: () => requestAnimationFrame(turnArrow) });
 
 // ---------- map ----------
+const AREA_COLORS = ['#ff9800', '#00e5ff', '#ff4081', '#b2ff59', '#e040fb', '#ffea00'];
+const P = { sel: null, draw: false, counts: {} }; // plan editor selection: area id | 'extra' | 'route'
 const map = L.map('map', { zoomControl: false, preferCanvas: true, maxZoom: 22, attributionControl: true }).setView([0, 0], 2);
 map.attributionControl.setPrefix(false);
 const bases = {
@@ -140,7 +142,7 @@ async function newSurvey(name, copyPlanFrom, modeKey = settings.mode) {
   const survey = {
     id: db.uid(), name: name || 'Survey ' + ex.localStamp(Date.now()).slice(0, 16), created: Date.now(), clockOffsetS: null, obsCount: 0, mode: MODES[modeKey] ? modeKey : 'ism',
     progress: 0,
-    plan: copyPlanFrom ? JSON.parse(JSON.stringify(copyPlanFrom.plan)) : { boundary: [], route: [], points: [], spacing: settings.spacing, bearing: null },
+    plan: copyPlanFrom ? JSON.parse(JSON.stringify(copyPlanFrom.plan)) : { areas: [], route: [], points: [] },
   };
   // A copied plan starts fresh: nothing sampled yet.
   for (const pt of survey.plan.points || []) { pt.status = 'todo'; delete pt.why; if (pt.plat != null) { pt.lat = pt.plat; pt.lon = pt.plon; } }
@@ -150,6 +152,15 @@ async function newSurvey(name, copyPlanFrom, modeKey = settings.mode) {
 }
 export const saveSurvey = () => db.put('surveys', S.survey);
 
+/** Older surveys had one boundary; plans are now a list of areas. Existing points and routes are left untouched. */
+function migratePlan(plan) {
+  plan.points ||= []; plan.route ||= [];
+  if (!plan.areas) {
+    plan.areas = [];
+    if (plan.boundary?.length >= 3) plan.areas.push({ id: db.uid(), name: 'Site', ring: plan.boundary, fill: 'none', pattern: plan.pattern || 'square', spacing: plan.spacing || settings.spacing, bearing: plan.bearing ?? null, count: 10, seed: 1, color: AREA_COLORS[0] });
+  }
+  delete plan.boundary;
+}
 async function loadSurvey(id) {
   if (S.recording) await stopRecording();
   let survey = id && (await db.get('surveys', id));
@@ -157,7 +168,8 @@ async function loadSurvey(id) {
     const list = await db.all('surveys');
     survey = list.sort((a, b) => b.created - a.created)[0] || (await newSurvey());
   }
-  survey.plan.points ||= []; survey.mode ||= 'ism';
+  survey.mode ||= 'ism';
+  migratePlan(survey.plan);
   S.survey = survey;
   localStorage.setItem('sxyz.current', survey.id);
   S.points = (await db.bySurvey('points', survey.id)).sort((a, b) => a.t - b.t);
@@ -169,7 +181,7 @@ async function loadSurvey(id) {
   $('bMark').lastElementChild.textContent = mode().action === 'sample' ? 'Sample' : 'Mark';
   layers.readings.clearLayers();
   drawPlan(); rebuildRoute(true); drawTrack(); drawObs(); updateRecChip();
-  const pts = [...(survey.plan.boundary || []), ...(survey.plan.route || []), ...survey.plan.points.map((p) => [p.lat, p.lon]), ...S.points.slice(-200).map((p) => [p.lat, p.lon])];
+  const pts = [...survey.plan.areas.flatMap((a) => a.ring), ...(survey.plan.route || []), ...survey.plan.points.map((p) => [p.lat, p.lon]), ...S.points.slice(-200).map((p) => [p.lat, p.lon])];
   if (pts.length > 1) { setFollow(false); map.fitBounds(L.latLngBounds(pts).pad(0.15), { maxZoom: 19 }); }
 }
 function addStats(a, b) {
@@ -182,8 +194,15 @@ function addStats(a, b) {
 export function drawPlan() {
   drawPoints();
   layers.plan.clearLayers();
-  const { boundary, route } = S.survey.plan;
-  if (boundary?.length >= 2) L.polygon(boundary, { color: '#ff9800', weight: 3, fillOpacity: 0.05, interactive: false }).addTo(layers.plan);
+  const { areas, route } = S.survey.plan;
+  for (const a of areas) {
+    if (a.ring.length < 2) continue;
+    const sel = S.planShape && a.id === P.sel, empty = a.fill === 'none';
+    const shape = a.ring.length === 2 ? L.polyline(a.ring, { color: a.color, weight: 4, interactive: false })
+      : L.polygon(a.ring, { color: a.color, weight: sel ? 5 : 3, dashArray: empty ? '6 6' : null, fillColor: empty ? '#000' : a.color, fillOpacity: empty ? 0.25 : sel ? 0.18 : 0.06, interactive: false });
+    shape.addTo(layers.plan);
+    if (S.planShape && a.ring.length >= 3) shape.bindTooltip(esc(a.name), { permanent: true, direction: 'center', className: 'area-label' });
+  }
   if (route?.length >= 2) {
     L.polyline(route, { color: '#fff', weight: 6, opacity: 0.7, interactive: false }).addTo(layers.plan);
     L.polyline(route, { color: '#1565c0', weight: 3, dashArray: '8 7', interactive: false }).addTo(layers.plan);
@@ -202,7 +221,8 @@ function drawPoints() {
   drawPoints.target = tgt?.id;
   for (const pt of S.survey.plan.points) {
     const icon = L.divIcon({ className: '', html: `<div class="spt ${pt.status}${tgt === pt ? ' tgt' : ''}"><span>${esc(pt.id)}</span></div>`, iconSize: [20, 20], iconAnchor: [10, 10] });
-    L.marker([pt.lat, pt.lon], { icon }).on('click', () => { if (!S.planShape) openPoint(pt); }).addTo(layers.points);
+    // In the plan editor points must not swallow taps meant for the map or the edit handles.
+    L.marker([pt.lat, pt.lon], { icon, interactive: !S.planShape }).on('click', () => openPoint(pt)).addTo(layers.points);
   }
 }
 function rebuildRoute(replay) {
@@ -516,20 +536,24 @@ $('followBtn').onclick = () => {
 };
 
 // ---------- plan editing ----------
-const isPts = () => S.planShape === 'points';
-const defaultFill = () => (mode().guide === 'points' || (mode().guide === 'auto' && S.survey.plan.points.length && !S.survey.plan.route.length) ? 'points' : 'route');
-// What the generate row makes: on the Boundary tab it fills with whatever this survey type uses.
-const genPts = () => (S.planShape === 'boundary' ? defaultFill() : S.planShape) === 'points';
-const planPts = () => S.survey.plan[S.planShape];
+// A plan is a list of areas. Each area has its own fill (sampling points,
+// walk transects, or empty) and density; points and transects are rebuilt
+// automatically whenever an area changes. A smaller area inside a larger one
+// takes over its ground, so focus areas and exclusion zones just work.
+// Targeted points and a free-drawn route sit alongside the areas.
 let planBefore = '';
-$('planPattern').innerHTML = Object.entries(PATTERNS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
+const defaultFill = () => (mode().guide === 'points' ? 'points' : mode().guide === 'route' ? 'route' : 'none');
+const selArea = () => S.survey.plan.areas.find((a) => a.id === P.sel);
+const manualPoints = () => S.survey.plan.points.filter((p) => !p.auto && p.status === 'todo');
+const fmtArea = (m2) => (m2 >= 10000 ? (m2 / 10000).toFixed(2) + ' ha' : Math.round(m2) + ' m²');
 
 export function nextPointId(prefix) {
-  const pre = prefix ?? (S.survey.plan.prefix || 'S');
+  const pre = prefix ?? 'T';
   const re = new RegExp('^' + pre.replace(/[^\w]/g, '\\$&') + '(\\d+)$');
   const n = S.survey.plan.points.reduce((m, p) => Math.max(m, +(p.id.match(re) || [])[1] || 0), 0) + 1;
   return pre + String(n).padStart(2, '0');
 }
+/** Add a hand-placed point (targeted, step-out, imported). These are never touched by regeneration. */
 export function addPoint(lat, lon, kind, id) {
   const taken = new Set(S.survey.plan.points.map((p) => p.id));
   const pt = { id: id && !taken.has(id) ? id : nextPointId(), lat, lon, kind, status: 'todo' };
@@ -537,139 +561,255 @@ export function addPoint(lat, lon, kind, id) {
   return pt;
 }
 
+function newArea(props = {}) {
+  const areas = S.survey.plan.areas, n = areas.length;
+  const base = areas[0]?.spacing || settings.spacing;
+  const a = {
+    id: db.uid(), name: n ? `Focus area ${n}` : 'Site', ring: [], fill: defaultFill(), pattern: 'square',
+    spacing: n ? Math.max(1, Math.round(base / 2)) : base, bearing: null, count: 10, randomStart: false, seed: 1 + Math.floor(Math.random() * 1e6),
+    color: AREA_COLORS[n % AREA_COLORS.length],
+  };
+  for (const [k, v] of Object.entries(props)) if (v != null) a[k] = v;
+  areas.push(a);
+  return a;
+}
+
+/** Rebuild automatic points and transects from the areas. Sampled points and hand-placed points are kept. */
+function regenerate() {
+  const plan = S.survey.plan;
+  const built = buildPlan(plan.areas);
+  if (built.points.length > 3000) { toast(`That would be ${built.points.length} points — use a wider spacing.`, 5000); return false; }
+  const sampled = new Set(ex.samplesOnly(S.obs).map((o) => o.pointId));
+  const keep = plan.points.filter((p) => !p.auto || p.status !== 'todo' || sampled.has(p.id));
+  const keptAuto = keep.filter((p) => p.auto);
+  const fresh = built.points.filter((n) => !keptAuto.some((k) => haversine(k.plat ?? k.lat, k.plon ?? k.lon, n.lat, n.lon) < 1));
+  const used = new Set(keep.map((p) => p.id)), pre = plan.prefix || 'S', width = fresh.length > 99 ? 3 : 2;
+  let n = 0;
+  for (const p of fresh) {
+    let id;
+    do id = pre + String(++n).padStart(width, '0'); while (used.has(id));
+    Object.assign(p, { id, auto: true, status: 'todo' });
+  }
+  plan.points = [...keptAuto, ...fresh, ...keep.filter((p) => !p.auto)];
+  if (built.route.length >= 2 || plan.routeAuto) { plan.route = built.route; plan.routeAuto = built.route.length >= 2; }
+  P.counts = built.counts;
+  return true;
+}
+
 function enterPlan() {
   if (S.recording) { toast('Stop recording before editing the plan.'); return; }
   closeSheet();
   const plan = S.survey.plan;
   planBefore = JSON.stringify(plan.route);
-  const fill = defaultFill();
-  S.planShape = plan.boundary.length ? fill : plan[fill].length ? fill : 'boundary';
+  S.planShape = 'plan';
   $('planbar').hidden = false; $('guide').hidden = true; $('crosshair').hidden = false;
   $('bPlan').classList.add('on');
   targetLine.remove();
-  $('planSpacing').value = plan.spacing || settings.spacing;
-  $('planBearing').value = plan.bearing ?? '';
-  $('planPattern').value = plan.pattern || 'square';
-  refreshPlanEdit();
+  P.draw = false; P.counts = buildPlan(plan.areas).counts;
+  if (!plan.areas.length && !plan.points.length && !plan.route.length) { P.sel = newArea().id; P.draw = true; }
+  else P.sel = plan.areas[0]?.id ?? (plan.points.length ? 'extra' : 'route');
+  renderPlan();
 }
 function exitPlan() {
+  const plan = S.survey.plan;
+  plan.areas = plan.areas.filter((a) => a.ring.length >= 3);
+  regenerate();
   S.planShape = null;
   $('planbar').hidden = true; $('crosshair').hidden = true;
   $('bPlan').classList.remove('on');
   layers.edit.clearLayers();
-  if (JSON.stringify(S.survey.plan.route) !== planBefore) S.survey.progress = 0;
+  if (JSON.stringify(plan.route) !== planBefore) S.survey.progress = 0;
   saveSurvey(); drawPlan(); rebuildRoute(true);
   refreshGuide();
 }
-function refreshPlanEdit() {
-  const shape = S.planShape;
-  document.querySelectorAll('#planbar .seg button').forEach((b) => b.classList.toggle('on', b.dataset.shape === shape));
-  const random = genPts() && $('planPattern').value === 'random';
-  $('planGen').hidden = shape === 'boundary' && S.survey.plan.boundary.length < 3;
-  $('planPattern').hidden = $('lblKeep').hidden = !genPts();
-  $('lblRandom').hidden = !genPts() || random;
-  $('lblCount').hidden = !random;
-  $('lblSpacing').hidden = $('lblBearing').hidden = random;
-  $('planGenerate').textContent = genPts() ? 'Generate points' : 'Fill with transects';
+
+/** Full redraw of the plan editor: chips, the panel for the selected item, and the map. */
+function renderPlan() {
+  const plan = S.survey.plan;
+  const a = selArea();
+  if (!a && P.sel !== 'extra' && P.sel !== 'route') P.sel = 'extra';
+  const showRoute = !plan.routeAuto && (mode().guide !== 'points' || plan.route.length > 0);
+  if (P.sel === 'route' && !showRoute) P.sel = 'extra';
+  const nExtra = plan.points.filter((p) => !p.auto).length;
+  $('planChips').innerHTML = plan.areas.map((x) => `<button data-s="${x.id}" class="${x.id === P.sel ? 'on' : ''}"><i style="background:${x.color}"></i>${esc(x.name)}</button>`).join('')
+    + '<button data-s="+" class="add">+ Area</button>'
+    + `<button data-s="extra" class="${P.sel === 'extra' ? 'on' : ''}">Targeted points${nExtra ? ` (${nExtra})` : ''}</button>`
+    + (showRoute ? `<button data-s="route" class="${P.sel === 'route' ? 'on' : ''}">Free route</button>` : '');
+  $('planChips').querySelector('.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+
+  const panel = $('planPanel');
+  const tools = (extra = '') => `<div class="row wrap"><button data-a="here">+ Here</button><button data-a="undo">Undo</button>${extra}</div>`;
+  if (a && P.draw) {
+    panel.innerHTML = `<div class="hint">Tap round the edge of <b>${esc(a.name)}</b>, or walk it pressing “+ Here”. Drag a corner to move it; tap a <b>+</b> to add one in between.</div>
+      ${tools('<button data-a="finish" class="primary">Finish shape</button><button data-a="delete" class="danger">Delete</button>')}`;
+  } else if (a) {
+    const pts = a.fill === 'points', random = pts && a.pattern === 'random';
+    panel.innerHTML = `
+      <div class="row wrap">
+        <div class="seg" id="aFill">${[['points', 'Points'], ['route', 'Transects'], ['none', 'Empty']].map(([v, t]) => `<button data-v="${v}" class="${a.fill === v ? 'on' : ''}">${t}</button>`).join('')}</div>
+        <span class="row links"><button data-a="shape">Edit shape</button><button data-a="rename">Rename</button><button data-a="delete" class="danger">Delete</button></span>
+      </div>
+      ${a.fill === 'none' ? '' : `<div class="row wrap">
+        ${pts ? `<select id="aPattern" aria-label="Pattern">${Object.entries(PATTERNS).map(([k, v]) => `<option value="${k}" ${k === a.pattern ? 'selected' : ''}>${v}</option>`).join('')}</select>` : ''}
+        ${random ? `<label>Points <input id="aCount" type="number" inputmode="numeric" min="1" step="1" value="${a.count}"></label><button data-a="shuffle">Reshuffle</button>`
+    : `<label>Spacing <input id="aSpacing" type="number" inputmode="decimal" min="0.5" step="0.5" value="${a.spacing}"> m</label>
+           <label>Bearing <input id="aBearing" type="number" inputmode="numeric" min="0" max="359" step="1" placeholder="auto" value="${a.bearing ?? ''}">°</label>`}
+        ${pts && !random ? `<label class="check"><input id="aRandom" type="checkbox" ${a.randomStart ? 'checked' : ''}> Random start</label>` : ''}
+      </div>`}
+      <div class="hint" id="aInfo"></div>`;
+  } else if (P.sel === 'extra') {
+    panel.innerHTML = `<div class="hint">Tap the map to add a point at a known or suspected source (tank, drain, stained ground). Drag a point to move it. These are kept whatever you do to the areas.</div>${tools()}`;
+  } else {
+    panel.innerHTML = `<div class="hint">Tap the map to add route points in walking order. Drag points to adjust.</div>${tools('<button data-a="clear" class="danger">Clear</button>')}`;
+  }
+  refreshPlanMap();
+}
+
+/** Redraw the map side of the plan editor and the summary lines, leaving the panel's inputs alone. */
+function refreshPlanMap() {
+  const plan = S.survey.plan, a = selArea();
   drawPlan();
   layers.edit.clearLayers();
-  const pts = planPts();
-  if (pts.length <= 400) pts.forEach((p, i) => {
-    const m = L.marker(isPts() ? [p.lat, p.lon] : p, { draggable: true, icon: L.divIcon({ className: '', html: `<div class="vtx ${shape}"></div>`, iconSize: [22, 22], iconAnchor: [11, 11] }) });
-    m.on('drag', () => {
-      const ll = m.getLatLng();
-      if (isPts()) { p.lat = ll.lat; p.lon = ll.lng; } else pts[i] = [ll.lat, ll.lng];
-    });
-    m.on('dragend', () => { saveSurvey(); drawPlan(); planInfo(); });
+  const handle = (ll, cls, onDrag, onEnd) => {
+    const m = L.marker(ll, { draggable: true, zIndexOffset: 3000, icon: L.divIcon({ className: '', html: `<div class="vtx ${cls}"></div>`, iconSize: [22, 22], iconAnchor: [11, 11] }) });
+    m.on('drag', () => { const p = m.getLatLng(); onDrag(p.lat, p.lng); });
+    m.on('dragend', () => { saveSurvey(); onEnd(); });
     m.addTo(layers.edit);
-  });
-  planInfo();
-}
-function planInfo() {
-  const { boundary, route, points } = S.survey.plan;
-  const bits = [];
-  if (boundary.length >= 3) { const a = polygonArea(boundary); bits.push(`Area ${a >= 10000 ? (a / 10000).toFixed(2) + ' ha' : Math.round(a) + ' m²'}`); }
-  if (route.length >= 2 && !genPts()) { const len = pathLength(route); bits.push(`Route ${fmtDist(len)} · ${route.length - 1} legs · about ${Math.max(1, Math.round(len / 60))} min at 1 m/s`); }
-  if (genPts()) {
-    if (points.length) {
-      const kinds = {};
-      points.forEach((p) => { kinds[p.kind] = (kinds[p.kind] || 0) + 1; });
-      bits.push(`${points.length} points (${Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ')})`);
+  };
+  if (a && P.draw) {
+    a.ring.forEach((p, i) => handle(p, 'area', (lat, lon) => { a.ring[i] = [lat, lon]; drawPlan(); }, refreshPlanMap));
+    const n = a.ring.length;
+    for (let i = 0; i < (n >= 3 ? n : n - 1); i++) {
+      const p = a.ring[i], q = a.ring[(i + 1) % n];
+      L.marker([(p[0] + q[0]) / 2, (p[1] + q[1]) / 2], { zIndexOffset: 2500, icon: L.divIcon({ className: '', html: '<div class="mid">+</div>', iconSize: [20, 20], iconAnchor: [10, 10] }) })
+        .on('click', (e) => { L.DomEvent.stop(e); a.ring.splice(i + 1, 0, [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2]); saveSurvey(); refreshPlanMap(); })
+        .addTo(layers.edit);
     }
-    const G = parseFloat($('planSpacing').value);
-    if (G > 0 && $('planPattern').value !== 'random') {
-      bits.push(`${G} m square grid finds circular hotspots ≥ ${hotspotDiameter(G).toFixed(1)} m across (95%)` + (boundary.length >= 3 ? `, about ${Math.round(polygonArea(boundary) / (G * G))} points` : ''));
-    }
-    if (isPts()) bits.push('Tap the map to add targeted points');
+  } else if (P.sel === 'extra') {
+    for (const pt of manualPoints()) handle([pt.lat, pt.lon], 'points', (lat, lon) => { pt.lat = lat; pt.lon = lon; }, refreshPlanMap);
+  } else if (P.sel === 'route' && plan.route.length <= 400) {
+    plan.route.forEach((p, i) => handle(p, 'route', (lat, lon) => { plan.route[i] = [lat, lon]; drawPlan(); }, refreshPlanMap));
   }
-  const hint = { boundary: 'Tap the map to add boundary corners (or “+ Here” while walking the edge), then switch to Route or Points to fill it.', route: 'Tap the map to add route points in walking order. Drag points to adjust.' };
-  $('planInfo').textContent = bits.join(' · ') || hint[S.planShape];
+
+  const info = $('aInfo');
+  if (info && a) {
+    const size = polygonArea(a.ring), n = P.counts[a.id] ?? 0;
+    info.textContent = a.fill === 'none' ? `${fmtArea(size)} · left empty: no points are placed inside this area, including those of any larger area around it.`
+      : a.fill === 'route' ? `${fmtArea(size)} · ${n} transects ${a.spacing} m apart`
+        : a.pattern === 'random' ? `${fmtArea(size)} · ${n} random points`
+          : `${fmtArea(size)} · ${n} points · about one per ${fmtArea(a.spacing * a.spacing)} · finds circular hotspots ≥ ${hotspotDiameter(a.spacing).toFixed(1)} m across (95%)`;
+  }
+  const auto = plan.points.filter((p) => p.auto).length, extra = plan.points.length - auto;
+  const bits = [];
+  if (plan.points.length) bits.push(`${plan.points.length} sampling points` + (extra && auto ? ` (${auto} from areas, ${extra} targeted)` : ''));
+  if (plan.route.length >= 2) { const len = pathLength(plan.route); bits.push(`route ${fmtDist(len)}, about ${Math.max(1, Math.round(len / 60))} min at 1 m/s`); }
+  $('planInfo').textContent = bits.length ? 'Plan total: ' + bits.join(' · ') : '';
 }
-function addVertex(lat, lon) {
-  if (isPts()) addPoint(lat, lon, 'targeted'); else planPts().push([lat, lon]);
-  saveSurvey(); refreshPlanEdit();
+
+/** An area setting changed: rebuild, save and refresh without disturbing the input being typed in. */
+function areaChanged(full) {
+  regenerate(); saveSurvey();
+  if (full) renderPlan(); else refreshPlanMap();
 }
-map.on('click', (e) => { if (S.planShape) addVertex(e.latlng.lat, e.latlng.lng); });
+
+map.on('click', (e) => {
+  if (!S.planShape) return;
+  const plan = S.survey.plan, { lat, lng } = e.latlng, a = selArea();
+  if (P.sel === 'extra') addPoint(lat, lng, 'targeted');
+  else if (P.sel === 'route') plan.route.push([lat, lng]);
+  else if (a && P.draw) a.ring.push([lat, lng]);
+  else {
+    // Tapping inside an area selects it (the innermost one where they overlap).
+    const hit = plan.areas.filter((x) => insideRing(x.ring, lat, lng)).sort((x, y) => polygonArea(x.ring) - polygonArea(y.ring))[0];
+    if (hit && hit.id !== P.sel) { P.sel = hit.id; renderPlan(); }
+    return;
+  }
+  saveSurvey();
+  if (P.sel === 'extra') renderPlan(); else refreshPlanMap();
+});
 $('bPlan').onclick = () => (S.planShape ? exitPlan() : enterPlan());
 $('planDone').onclick = exitPlan;
-document.querySelectorAll('#planbar .seg button').forEach((b) => { b.onclick = () => { S.planShape = b.dataset.shape; refreshPlanEdit(); }; });
-$('planPattern').onchange = refreshPlanEdit;
-$('planSpacing').oninput = planInfo;
-$('planGps').onclick = () => {
-  if (!S.est) return toast('No GPS fix yet.');
-  if (S.fix.acc > settings.maxAcc) return toast(`GPS too poor right now (±${Math.round(S.fix.acc)} m).`);
-  addVertex(S.est.lat, S.est.lon);
-};
-$('planUndo').onclick = () => { planPts().pop(); saveSurvey(); refreshPlanEdit(); };
-$('planClear').onclick = () => {
-  if (!planPts().length || !confirm(`Clear the ${isPts() ? 'sampling points' : S.planShape}?`)) return;
-  S.survey.plan[S.planShape] = []; saveSurvey(); refreshPlanEdit();
-};
-$('planGenerate').onclick = () => {
-  const plan = S.survey.plan;
-  if (plan.boundary.length < 3) return toast('Draw a boundary first (at least 3 corners).');
-  const random = genPts() && $('planPattern').value === 'random';
-  const spacing = parseFloat($('planSpacing').value);
-  if (!random && !(spacing >= 0.5)) return toast('Enter a spacing in metres.');
-  let b = parseFloat($('planBearing').value);
-  if (!Number.isFinite(b)) { b = longestEdgeBearing(plan.boundary); $('planBearing').value = b; }
-  if (genPts()) {
-    const count = parseInt($('planCount').value, 10);
-    if (random && !(count > 0)) return toast('Enter how many random points you want.');
-    const pattern = $('planPattern').value;
-    const made = samplePoints(plan.boundary, { pattern, spacing, bearing: b, count, randomStart: $('planRandom').checked });
-    if (!made.length) return toast('No points fit inside the boundary at that spacing.');
-    if (made.length > 2000) return toast(`That would be ${made.length} points — use a larger spacing.`, 5000);
-    const keep = $('planKeep').checked;
-    if (!keep && plan.points.length && !confirm(`Replace the ${plan.points.length} existing points? (Tick “Keep existing” to add to them instead.)`)) return;
-    if (!keep) plan.points = [];
-    for (const [lat, lon] of made) addPoint(lat, lon, pattern === 'random' ? 'random' : 'grid');
-    Object.assign(plan, { pattern, spacing: random ? plan.spacing : spacing, bearing: b });
-    S.planShape = 'points';
-    saveSurvey(); refreshPlanEdit();
-    return toast(`${made.length} sampling points ${keep ? 'added' : 'created'}.`);
+
+$('planChips').onclick = (e) => {
+  const s = e.target.closest('button')?.dataset.s;
+  if (!s) return;
+  const cur = selArea();
+  if (cur && P.draw) {
+    if (cur.ring.length < 3) S.survey.plan.areas = S.survey.plan.areas.filter((x) => x !== cur); // abandon an unfinished shape
+    regenerate();
   }
-  if (plan.route.length && !confirm('Replace the existing route?')) return;
-  const route = generateTransects(plan.boundary, spacing, b);
-  if (route.length < 2) return toast('Boundary is too small for that spacing.');
-  plan.route = route; plan.spacing = spacing; plan.bearing = b;
-  settings.spacing = spacing; saveSettings(); saveSurvey();
-  S.planShape = 'route'; refreshPlanEdit();
-  toast(`${route.length / 2} transects, ${fmtDist(pathLength(route))} to walk.`);
+  P.draw = s === '+';
+  P.sel = s === '+' ? newArea().id : s;
+  saveSurvey(); renderPlan();
 };
+
+$('planPanel').onclick = (e) => {
+  const plan = S.survey.plan, a = selArea();
+  const fill = e.target.closest('#aFill button')?.dataset.v;
+  if (fill && a) { a.fill = fill; return areaChanged(true); }
+  const act = e.target.closest('button')?.dataset.a;
+  if (!act) return;
+  const list = a ? a.ring : P.sel === 'route' ? plan.route : null;
+  if (act === 'here') {
+    if (!S.est) return toast('No GPS fix yet.');
+    if (S.fix.acc > settings.maxAcc) return toast(`GPS too poor right now (±${Math.round(S.fix.acc)} m).`);
+    if (list) list.push([S.est.lat, S.est.lon]); else addPoint(S.est.lat, S.est.lon, 'targeted');
+  }
+  if (act === 'undo') {
+    if (list) list.pop();
+    else { const last = manualPoints().pop(); if (last) plan.points = plan.points.filter((p) => p !== last); }
+  }
+  if (act === 'clear') { if (!plan.route.length || !confirm('Clear the route?')) return; plan.route = []; }
+  if (act === 'finish') {
+    if (a.ring.length < 3) return toast('An area needs at least 3 corners.');
+    P.draw = false;
+    return areaChanged(true);
+  }
+  if (act === 'shape') { P.draw = true; return renderPlan(); }
+  if (act === 'rename') {
+    const name = prompt('Area name', a.name);
+    if (!name?.trim()) return;
+    a.name = name.trim();
+  }
+  if (act === 'delete') {
+    if (a.ring.length >= 3 && !confirm(`Delete “${a.name}” and the points or transects it generates?`)) return;
+    plan.areas = plan.areas.filter((x) => x !== a);
+    P.draw = false; P.sel = plan.areas[0]?.id ?? 'extra';
+    return areaChanged(true);
+  }
+  if (act === 'shuffle') { a.seed = 1 + Math.floor(Math.random() * 1e6); return areaChanged(false); }
+  saveSurvey();
+  if (act === 'rename' || !list) renderPlan(); else refreshPlanMap();
+};
+$('planPanel').oninput = (e) => {
+  const a = selArea();
+  if (!a) return;
+  const id = e.target.id, v = e.target.value;
+  if (id === 'aPattern') { a.pattern = v; return areaChanged(true); }
+  if (id === 'aRandom') a.randomStart = e.target.checked;
+  if (id === 'aSpacing') { if (!(parseFloat(v) >= 0.5)) return; a.spacing = parseFloat(v); if (a === S.survey.plan.areas[0]) { settings.spacing = a.spacing; saveSettings(); } }
+  if (id === 'aCount') { if (!(parseInt(v, 10) > 0)) return; a.count = parseInt(v, 10); }
+  if (id === 'aBearing') a.bearing = v === '' ? null : ((parseFloat(v) % 360) + 360) % 360;
+  areaChanged(false);
+};
+
 $('planImport').onclick = async () => {
   const file = await pickFile('.geojson,.json,.gpx,.kml,application/geo+json,application/json');
   if (!file) return;
   try {
     const res = ex.parsePlanFile(await file.text());
     const plan = S.survey.plan;
-    if (res.boundary) plan.boundary = res.boundary;
-    if (res.route) plan.route = res.route;
-    for (const p of res.points) addPoint(p.lat, p.lon, 'imported', p.id != null ? String(p.id) : null);
-    saveSurvey(); refreshPlanEdit();
+    plan.areas = plan.areas.filter((a) => a.ring.length >= 3);
+    for (const a of res.areas) newArea({ ring: a.ring, name: a.name, fill: a.fill, pattern: a.pattern, spacing: a.spacing, bearing: a.bearing, count: a.count });
+    if (res.route && !res.areas.some((a) => a.fill === 'route')) { plan.route = res.route; plan.routeAuto = false; }
+    // Points that our own areas will regenerate are not imported twice.
+    const own = res.areas.some((a) => a.fill === 'points');
+    for (const p of res.points) if (!own || !/^(grid|random)$/.test(p.type || '')) addPoint(p.lat, p.lon, 'imported', p.id != null ? String(p.id) : null);
+    P.draw = false; P.sel = plan.areas[plan.areas.length - 1]?.id ?? (res.points.length ? 'extra' : 'route');
+    areaChanged(true);
     setFollow(false);
-    map.fitBounds(L.latLngBounds([...(res.boundary || []), ...(res.route || []), ...res.points.map((p) => [p.lat, p.lon])]).pad(0.15), { maxZoom: 19 });
-    toast(`Imported ${[res.boundary && 'boundary', res.route && 'route', res.points.length && `${res.points.length} points`].filter(Boolean).join(', ')}.`);
+    map.fitBounds(L.latLngBounds([...res.areas.flatMap((a) => a.ring), ...(res.route || []), ...res.points.map((p) => [p.lat, p.lon])]).pad(0.15), { maxZoom: 19 });
+    toast(`Imported ${[res.areas.length && `${res.areas.length} area${res.areas.length > 1 ? 's' : ''}`, res.route && 'route', res.points.length && `${res.points.length} points`].filter(Boolean).join(', ')}.`);
   } catch (e) { toast('Import failed: ' + e.message, 6000); }
 };
 
@@ -950,7 +1090,7 @@ async function openSurveys() {
   const b = openSheet('Surveys', `
     <label class="field">New survey name<input id="sName" placeholder="e.g. North cell – Nov ISM"></label>
     <label class="field">Survey type<select id="sMode">${Object.entries(MODES).map(([k, m]) => `<option value="${k}" ${k === S.survey.mode ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}</select></label>
-    <label class="field inline"><input type="checkbox" id="sCopy" ${S.survey.plan.route.length || S.survey.plan.boundary.length ? 'checked' : ''}>Copy the plan (boundary, route, points) from “${esc(S.survey.name)}”</label>
+    <label class="field inline"><input type="checkbox" id="sCopy" ${S.survey.plan.route.length || S.survey.plan.areas.length || S.survey.plan.points.length ? 'checked' : ''}>Copy the plan (areas, route, points) from “${esc(S.survey.name)}”</label>
     <div class="actions"><button class="btn primary" id="sNew">Create</button><button class="btn" id="sImport">Restore backup</button></div>
     <h3>On this device</h3>
     <div class="list">${list.map((s) => `<div class="survey-row ${s.id === S.survey.id ? 'cur' : ''}" data-id="${s.id}">
@@ -1058,7 +1198,7 @@ function openSettings() {
       ['cats_' + S.survey.mode]: q('#oCats').value, ['unit_' + S.survey.mode]: q('#oUnit').value.trim(),
     });
     const prefix = q('#oPrefix').value.trim() || 'S';
-    if (prefix !== (S.survey.plan.prefix || 'S')) { S.survey.plan.prefix = prefix; saveSurvey(); }
+    if (prefix !== (S.survey.plan.prefix || 'S')) { S.survey.plan.prefix = prefix; regenerate(); saveSurvey(); drawPlan(); }
     saveSettings();
     if (filter.o.mode !== settings.filterMode) { filter.o.mode = settings.filterMode; filter.reset(); }
     filter.o.maxAcc = settings.maxAcc;
@@ -1076,8 +1216,10 @@ function openHelp() {
     <h3>Survey types</h3>
     <p>Each survey has a type (<b>Menu → Survey type</b>): <b>Gas walkover (ISM)</b> follows a walked route; <b>Contaminated land sampling</b> plans sampling points and logs samples; <b>General</b> is plain tracking, notes and photos.</p>
     <h3>1 · Plan</h3>
-    <p>Tap <b>Plan</b>, tap the corners of the area (or walk the edge pressing <b>+ Here</b>), set a spacing and press <b>Fill with transects</b> for a back-and-forth walk pattern. Or switch to <b>Route</b> and tap out any path. Boundaries and routes can also be imported from GeoJSON, KML or GPX.</p>
-    <p><b>Sampling points:</b> draw the boundary, switch to <b>Points</b>, pick a pattern (square, triangular or herringbone grid, or random), set the spacing and <b>Generate points</b>. Tap the map to add targeted points at known sources. Tick <b>Keep existing</b> to layer a finer grid over part of the site: redraw the boundary round that part and generate again. The app shows the hotspot size a grid spacing will find; the choice still needs site-specific justification in your sampling plan.</p>
+    <p>Tap <b>Plan</b> and tap round the edge of the site (or walk it pressing <b>+ Here</b>), then <b>Finish shape</b>. The area fills itself straight away: sampling points or walk transects, depending on the survey type. Change the pattern, spacing or bearing and the map updates as you type.</p>
+    <p><b>+ Area</b> adds another area with its own settings. Draw one inside the site for a <b>focus area</b> with a tighter grid: it replaces the site grid there. Set an area to <b>Empty</b> to keep points out of it (a building, a pond). Tap an area on the map to select it.</p>
+    <p><b>Targeted points</b> are single points you tap in at known sources; they are never changed by the areas. Plans can be imported from GeoJSON, KML or GPX, and a plan exported from here re-imports with its areas and settings.</p>
+    <p class="muted">The hotspot size shown for a grid is an aid; the choice of density still needs site-specific justification in your sampling plan.</p>
     <h3>Sampling</h3>
     <p>The arrow leads to the next point with the distance to it. Tap <b>Sample</b> on arrival: the sample ID, depth, type (primary, duplicate, blanks), method, soil description, evidence of contamination, PID reading, analysis and photos are saved against the location with the position you actually sampled at. <b>Save + next depth</b> logs another depth at the same spot. Tap a point on the map to navigate to it, mark it as not sampled with a reason, move it, or add step-out points around it.</p>
     <h3>2 · Sync the instrument clock</h3>

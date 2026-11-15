@@ -100,10 +100,14 @@ export function obsGeoJSON(obs) {
 export function planGeoJSON(survey) {
   const plan = survey.plan || {};
   const feats = [];
-  if (plan.boundary?.length >= 3) {
-    const ring = plan.boundary.map((p) => [f7(p[1]), f7(p[0])]);
+  for (const a of plan.areas || []) {
+    if (a.ring.length < 3) continue;
+    const ring = a.ring.map((p) => [f7(p[1]), f7(p[0])]);
     ring.push(ring[0]);
-    feats.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [ring] }, properties: { kind: 'boundary', survey: survey.name } });
+    feats.push({
+      type: 'Feature', geometry: { type: 'Polygon', coordinates: [ring] },
+      properties: { kind: 'area', name: a.name, fill: a.fill, pattern: a.fill === 'points' ? a.pattern : null, spacing_m: a.fill !== 'none' && a.pattern !== 'random' ? a.spacing : null, bearing_deg: a.bearing ?? null, count: a.pattern === 'random' ? a.count : null, survey: survey.name },
+    });
   }
   if (plan.route?.length >= 2) {
     feats.push({
@@ -115,7 +119,7 @@ export function planGeoJSON(survey) {
   for (const pt of plan.points || []) {
     feats.push({
       type: 'Feature', geometry: { type: 'Point', coordinates: [f7(pt.lon), f7(pt.lat)] },
-      properties: { kind: 'sample_point', id: pt.id, point_type: pt.kind, status: pt.status, reason: pt.why || '', survey: survey.name },
+      properties: { kind: 'sample_point', id: pt.id, point_type: pt.kind, area: (plan.areas || []).find((a) => a.id === pt.area)?.name || '', status: pt.status, reason: pt.why || '', survey: survey.name },
     });
   }
   return fc('plan', feats);
@@ -208,7 +212,8 @@ observations.csv       same, as a table
 samples.csv            sample register (${samplesOnly(obs).length}): ID, location, depth, type, soil description,
                        analysis requested, actual and planned coordinates
 samples.geojson        same, as points
-plan.geojson           site boundary, planned route and planned sampling points (with status)
+plan.geojson           plan areas (site, focus and exclusion areas with their settings), planned
+                       route and planned sampling points (with status and area)
 track.gpx              track + waypoints + planned route for GPS tools / Google Earth
 survey.json            full backup; re-import in SurveyXYZ (Menu > Surveys > Import backup)
 photos/                observation photos, named obsNNN_n.jpg
@@ -223,21 +228,25 @@ widget type Attachment, relative path, integrated viewer: Image.
 // ---- plan import (GeoJSON / GPX / KML) ----
 
 function fromGeoJSON(obj) {
-  const res = { boundary: null, route: null, points: [] };
+  const res = { areas: [], route: null, points: [] };
   const visit = (g, props) => {
     if (!g) return;
     if (g.type === 'FeatureCollection') g.features.forEach((f) => visit(f));
     else if (g.type === 'Feature') visit(g.geometry, g.properties);
     else if (g.type === 'GeometryCollection') g.geometries.forEach(visit);
-    else if (g.type === 'Point') res.points.push({ lat: g.coordinates[1], lon: g.coordinates[0], id: props?.id ?? props?.name ?? props?.Name ?? null });
-    else if (g.type === 'Polygon' && !res.boundary) res.boundary = g.coordinates[0];
-    else if (g.type === 'MultiPolygon' && !res.boundary) res.boundary = g.coordinates[0][0];
+    else if (g.type === 'Point') res.points.push({ lat: g.coordinates[1], lon: g.coordinates[0], id: props?.id ?? props?.name ?? props?.Name ?? null, type: props?.point_type ?? null });
+    else if (g.type === 'Polygon') res.areas.push({ ring: g.coordinates[0], props: props || {} });
+    else if (g.type === 'MultiPolygon') g.coordinates.forEach((c) => res.areas.push({ ring: c[0], props: props || {} }));
     else if (g.type === 'LineString' && !res.route) res.route = g.coordinates;
     else if (g.type === 'MultiLineString' && !res.route) res.route = g.coordinates.flat();
   };
   visit(obj);
   const ll = (c) => c && c.map((p) => [p[1], p[0]]).filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
-  res.boundary = ll(res.boundary); res.route = ll(res.route);
+  res.route = ll(res.route);
+  res.areas = res.areas.map(({ ring, props }) => ({
+    ring: ll(ring), name: props.name ?? props.Name ?? null, fill: props.fill ?? null, pattern: props.pattern ?? null,
+    spacing: props.spacing_m ?? null, bearing: props.bearing_deg ?? null, count: props.count ?? null,
+  }));
   return res;
 }
 
@@ -245,7 +254,7 @@ function kmlCoords(s) {
   return s.trim().split(/\s+/).map((t) => t.split(',').map(Number)).filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1])).map((p) => [p[1], p[0]]);
 }
 
-/** Parse a plan file. Returns {boundary: [[lat,lon]]|null, route: [[lat,lon]]|null}. */
+/** Parse a plan file. Returns {areas: [{ring, name, ...}], route: [[lat,lon]]|null, points: [{lat, lon, id}]}. */
 export function parsePlanFile(text) {
   const t = text.trim();
   let res;
@@ -261,23 +270,29 @@ export function parsePlanFile(text) {
       lat: +(m[1].match(/lat\s*=\s*["']([^"']+)/i) || [])[1], lon: +(m[1].match(/lon\s*=\s*["']([^"']+)/i) || [])[1],
       id: (m[2].match(/<name>([^<]*)<\/name>/i) || [])[1] || null,
     }));
-    res = { boundary: null, route: pts, points: wpts };
+    res = { areas: [], route: pts, points: wpts };
   } else if (/<kml[\s>]/i.test(t)) {
-    const poly = t.match(/<Polygon[\s\S]*?<coordinates>([\s\S]*?)<\/coordinates>/i);
+    const marks = [...t.matchAll(/<Placemark[\s\S]*?<\/Placemark>/gi)].map((m) => m[0]);
+    const areas = (marks.length ? marks : [t]).filter((m) => /<Polygon[\s>]/i.test(m)).map((m) => ({
+      ring: kmlCoords((m.match(/<Polygon[\s\S]*?<coordinates>([\s\S]*?)<\/coordinates>/i) || [])[1] || ''),
+      name: (m.match(/<name>([^<]*)<\/name>/i) || [])[1] || null,
+    }));
     const line = t.match(/<LineString[\s\S]*?<coordinates>([\s\S]*?)<\/coordinates>/i);
     const pms = [...t.matchAll(/<Placemark[\s\S]*?<\/Placemark>/gi)].map((m) => m[0]).filter((m) => /<Point[\s>]/i.test(m));
     const points = pms.map((m) => {
       const c = kmlCoords((m.match(/<Point[\s\S]*?<coordinates>([\s\S]*?)<\/coordinates>/i) || [])[1] || '')[0];
       return c ? { lat: c[0], lon: c[1], id: (m.match(/<name>([^<]*)<\/name>/i) || [])[1] || null } : null;
     }).filter(Boolean);
-    res = { boundary: poly ? kmlCoords(poly[1]) : null, route: line ? kmlCoords(line[1]) : null, points };
+    res = { areas, route: line ? kmlCoords(line[1]) : null, points };
   } else throw new Error('Unrecognised file: expected GeoJSON, GPX or KML');
   // Closed rings repeat the first vertex; we store them open.
-  const b = res.boundary;
-  if (b && b.length > 1 && b[0][0] === b[b.length - 1][0] && b[0][1] === b[b.length - 1][1]) b.pop();
-  if (b && b.length < 3) res.boundary = null;
+  for (const a of res.areas) {
+    const b = a.ring;
+    if (b.length > 1 && b[0][0] === b[b.length - 1][0] && b[0][1] === b[b.length - 1][1]) b.pop();
+  }
+  res.areas = res.areas.filter((a) => a.ring.length >= 3);
   if (res.route && res.route.length < 2) res.route = null;
   res.points = (res.points || []).filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon));
-  if (!res.boundary && !res.route && !res.points.length) throw new Error('No polygon, line or points found in file');
+  if (!res.areas.length && !res.route && !res.points.length) throw new Error('No polygon, line or points found in file');
   return res;
 }

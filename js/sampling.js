@@ -148,6 +148,7 @@ export function openSample(pt, existing, carry, spot) {
   };
 }
 
+const areaName = (pt) => S.survey.plan.areas.find((a) => a.id === pt.area)?.name;
 const KIND = { grid: 'Systematic grid', random: 'Random', targeted: 'Targeted', stepout: 'Step-out', imported: 'Imported' };
 const statusText = (pt) => (pt.status === 'done' ? 'Sampled' : pt.status === 'skipped' ? `Not sampled${pt.why ? ': ' + pt.why : ''}` : 'To do');
 
@@ -156,7 +157,7 @@ export function openPoint(pt) {
   const taken = samplesAt(pt.id);
   const d = S.est ? haversine(S.est.lat, S.est.lon, pt.lat, pt.lon) : null;
   const b = openSheet(`Point ${pt.id}`, `
-    <p>${esc(KIND[pt.kind] || pt.kind)} point <span class="badge ${pt.status}">${esc(statusText(pt))}</span></p>
+    <p>${esc(KIND[pt.kind] || pt.kind)} point${areaName(pt) ? ` in ${esc(areaName(pt))}` : ''} <span class="badge ${pt.status}">${esc(statusText(pt))}</span></p>
     <p class="muted">${pt.lat.toFixed(6)}, ${pt.lon.toFixed(6)}${d != null ? ` · ${fmtDist(d)} from you` : ''}${pt.plat != null ? ` · sampled ${haversine(pt.lat, pt.lon, pt.plat, pt.plon).toFixed(1)} m from the planned position` : ''}</p>
     ${taken.length ? `<h3>Samples here</h3><div class="list">${taken.map((o) => `<button class="btn" data-o="${o.id}"><span>${esc(o.data.sampleId || '(log only)')} <small>${esc(o.data.type || '')} · ${o.data.depthFrom ?? '?'}–${o.data.depthTo ?? '?'} m · ${localStamp(o.t).slice(11, 16)}</small></span></button>`).join('')}</div>` : ''}
     <h3>Actions</h3>
@@ -222,8 +223,8 @@ export function openPointList() {
     <div class="actions"><button class="btn primary" id="pNear">Go to the nearest unsampled point</button></div>
     <h3>All points</h3>
     <div class="list">${pts.map((p) => `<button class="btn" data-id="${esc(p.id)}"><span><b>${esc(p.id)}</b>${p === tgt ? ' <span class="badge">heading here</span>' : ''}<span class="badge ${p.status}">${esc(statusText(p))}</span>
-      <small>${esc(KIND[p.kind] || p.kind)}${d(p) != null ? ' · ' + fmtDist(d(p)) : ''}${samplesAt(p.id).length ? ` · ${samplesAt(p.id).length} sample(s)` : ''}</small></span></button>`).join('')}</div>`
-    : '<p class="muted">No sampling points yet. Tap <b>Plan</b>, draw the boundary, then switch to <b>Points</b> to generate a grid or tap targeted locations. Or just tap <b>Sample</b> where you stand to log an unplanned location.</p>');
+      <small>${esc(areaName(p) || KIND[p.kind] || p.kind)}${d(p) != null ? ' · ' + fmtDist(d(p)) : ''}${samplesAt(p.id).length ? ` · ${samplesAt(p.id).length} sample(s)` : ''}</small></span></button>`).join('')}</div>`
+    : '<p class="muted">No sampling points yet. Tap <b>Plan</b> and draw the site: it fills with a sampling grid you can adjust, and you can add focus areas and targeted points. Or just tap <b>Sample</b> where you stand to log an unplanned location.</p>');
   if (!pts.length) return;
   b.querySelector('#pNear').onclick = () => {
     if (!S.est) return toast('No GPS fix yet.');

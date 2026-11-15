@@ -35,13 +35,19 @@ Built around the sampling designs and field records in the NZ Ministry for the E
 *Contaminated Land Management Guidelines No. 5* (targeted and systematic patterns, grid sizing
 for hotspot detection, duplicates and blanks, sample labelling and soil logging).
 
-- **Plan → Points**: draw the boundary, pick a pattern and spacing, **Generate points**. The app
-  shows the smallest circular hotspot a square grid of that spacing finds with 95 % confidence
-  (grid = 0.59 × hotspot radius) and the point count. That figure is an aid only: the guideline is
-  explicit that grid size needs site-specific justification, not just the formula.
-- Tap the map for **targeted** points at known sources. Tick **Keep existing** and redraw the
-  boundary round part of the site to layer a finer grid there (multiple grids / stratified areas).
-  **Random start** offsets the grid origin randomly. Points can also be imported from GeoJSON, KML or GPX.
+- **Plan** is built from **areas**. Tap round the site and press **Finish shape**: it fills with a
+  sampling grid straight away. Change pattern (square, triangular, herringbone, random), spacing or
+  bearing and the map updates as you type, with the point count and the smallest circular hotspot
+  that grid finds at 95 % confidence (grid = 0.59 × hotspot radius). That figure is an aid only: the
+  guideline is explicit that grid size needs site-specific justification, not just the formula.
+- **+ Area** adds another area with its own density. Drawn inside the site it is a **focus area**:
+  its grid replaces the site grid there. Set an area to **Empty** for an exclusion zone (building,
+  pond). Tap an area on the map to select it; **Edit shape** gives draggable corners and **+**
+  handles to add corners.
+- **Targeted points** are tapped in individually at known sources and are never changed by the
+  areas. Points already sampled are kept if you later change a grid.
+- Plans import from GeoJSON, KML or GPX (every polygon becomes an area), and a plan exported from
+  the app re-imports with its areas and settings, ready for the next round.
 - In the field the arrow leads to the next point. **Sample** opens the log for the point you are at:
   depths, sample type (primary, duplicate, triplicate, composite sub-sample, rinsate/trip blank),
   sample ID, method, material and soil type, colour, moisture, odour, evidence of contamination,
@@ -62,7 +68,7 @@ replace chain-of-custody paperwork, though the register has what that paperwork 
 
 | Step | Where | What it does |
 |---|---|---|
-| Plan | **Plan** | Tap boundary corners (or walk the edge with **+ Here**), choose spacing and bearing, **Fill with transects**. Or tap out any route, or import GeoJSON / KML / GPX. |
+| Plan | **Plan** | Tap round the area (or walk the edge with **+ Here**), **Finish shape**, and it fills with walk transects; adjust spacing and bearing live. Add more areas with their own spacing; their transects are joined into one route. Or tap out a free route, or import GeoJSON / KML / GPX. |
 | Clock | **Menu → Instrument clock sync** | Records how far the gas monitor's clock is from the phone's, so the merge lines up. |
 | Walk | **Record** | The route is followed in order, start to finish. A compass arrow shows which way to face and walk, with the distance to the path (when off it) or to the next turn (when on it); beeps/vibrates when outside tolerance; walked sections turn green with a % complete. Tap the banner to continue from the nearest point, restart, or reverse the route. |
 | Observe | **Mark** / **Note** | One-tap numbered pin, or a note with photos, category, manual reading and text. Position is taken when you press the button. |

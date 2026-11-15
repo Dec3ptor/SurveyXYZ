@@ -273,7 +273,8 @@ export function pointInPolygon(poly, p) {
 }
 
 /**
- * Sampling locations inside a boundary. o: {pattern, spacing, bearing, count, randomStart}.
+ * Sampling locations inside a boundary. o: {pattern, spacing, bearing, count, randomStart, exclude}.
+ *  exclude: rings ([[lat,lon]]) inside which no points are placed.
  *  square / triangular / herringbone: systematic grids at `spacing` metres, rows along `bearing`.
  *  random: `count` uniformly random locations.
  * Returned in a walkable order (serpentine rows; nearest-neighbour for random). [[lat,lon], ...]
@@ -286,13 +287,17 @@ export function samplePoints(boundary, o, rnd = Math.random) {
   const ab = boundary.map((p) => { const [x, y] = f.toXY(p[0], p[1]); return [x * v[0] + y * v[1], x * u[0] + y * u[1]]; });
   let minA = Infinity, maxA = -Infinity, minB = Infinity, maxB = -Infinity;
   for (const p of ab) { minA = Math.min(minA, p[0]); maxA = Math.max(maxA, p[0]); minB = Math.min(minB, p[1]); maxB = Math.max(maxB, p[1]); }
+  // Areas to leave empty (inner focus or exclusion areas), in the same rotated frame.
+  const holes = (o.exclude || []).filter((r) => r.length >= 3).map((r) => r.map((p) => { const [x, y] = f.toXY(p[0], p[1]); return [x * v[0] + y * v[1], x * u[0] + y * u[1]]; }));
+  const ok = (p) => pointInPolygon(ab, p) && !holes.some((h) => pointInPolygon(h, p));
   let out = [];
   if (o.pattern === 'random') {
     const n = Math.max(0, Math.floor(o.count || 0));
     for (let tries = 0; out.length < n && tries < n * 500; tries++) {
       const p = [minA + rnd() * (maxA - minA), minB + rnd() * (maxB - minB)];
-      if (pointInPolygon(ab, p)) out.push(p);
+      if (ok(p)) out.push(p);
     }
+    if (!out.length) return [];
     // nearest-neighbour walk order
     const rest = out, ordered = [];
     let cur = rest.reduce((m, p) => (p[0] + p[1] < m[0] + m[1] ? p : m), rest[0]);
@@ -314,7 +319,7 @@ export function samplePoints(boundary, o, rnd = Math.random) {
       for (let i = -1, a = minA + offA - G; a <= maxA + G; i++, a += G) {
         const jo = ((j % 2) + 2) % 2, io = ((i % 2) + 2) % 2;
         const p = [a + (tri ? jo * G / 2 : her ? (jo ? 0.25 : -0.25) * G : 0), bb + (her ? (io ? 0.25 : -0.25) * G : 0)];
-        if (pointInPolygon(ab, p)) row.push(p);
+        if (ok(p)) row.push(p);
       }
       if (!row.length) continue;
       row.sort((p, q) => p[0] - q[0]);
@@ -324,4 +329,48 @@ export function samplePoints(boundary, o, rnd = Math.random) {
     }
   }
   return out.map(([a, bb]) => f.toLL(a * v[0] + bb * u[0], a * v[1] + bb * u[1]));
+}
+
+/** Small seeded random generator, so a random layout stays put until deliberately reshuffled. */
+export function seededRandom(seed) {
+  let a = (seed >>> 0) || 1;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Is [lat,lon] inside the ring [[lat,lon], ...]? */
+export function insideRing(ring, lat, lon) {
+  return ring.length >= 3 && pointInPolygon(ring.map((p) => [p[1], p[0]]), [lon, lat]);
+}
+
+/**
+ * Build the automatic parts of a plan from its areas.
+ * areas: [{id, ring, fill: 'points'|'route'|'none', pattern, spacing, bearing, count, randomStart, seed}]
+ * A smaller area overlapping a larger one owns its ground: the larger area's
+ * points are left out of it. So a focus area replaces the site grid inside it,
+ * and an area with fill 'none' is an exclusion zone.
+ * Returns {points: [{lat, lon, area, kind}], route: [[lat,lon]], counts: {areaId: n}}.
+ */
+export function buildPlan(areas) {
+  const valid = areas.filter((a) => a.ring.length >= 3);
+  const size = new Map(valid.map((a) => [a.id, polygonArea(a.ring)]));
+  const points = [], route = [], counts = {};
+  for (const a of valid) {
+    const b = Number.isFinite(a.bearing) ? a.bearing : longestEdgeBearing(a.ring);
+    if (a.fill === 'points') {
+      const exclude = valid.filter((o) => o !== a && size.get(o.id) < size.get(a.id)).map((o) => o.ring);
+      const made = samplePoints(a.ring, { ...a, bearing: b, exclude }, seededRandom(a.seed || 1));
+      counts[a.id] = made.length;
+      for (const [lat, lon] of made) points.push({ lat, lon, area: a.id, kind: a.pattern === 'random' ? 'random' : 'grid' });
+    } else if (a.fill === 'route') {
+      const t = generateTransects(a.ring, a.spacing, b);
+      counts[a.id] = t.length / 2;
+      route.push(...t);
+    }
+  }
+  return { points, route, counts };
 }

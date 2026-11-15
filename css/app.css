@@ -56,6 +56,16 @@ button.danger, .btn.danger { background: #fff; color: var(--bad); border-color: 
 #planbar .check { display: flex; align-items: center; gap: 6px; min-height: 44px; }
 #planbar .check input { width: 24px; height: 24px; margin: 0; }
 #planbar .seg button { padding: 0 11px; }
+#planbar > .row > b { font-size: 18px; padding-left: 4px; }
+#planPanel { display: flex; flex-direction: column; gap: 6px; }
+#planChips { display: flex; gap: 6px; overflow-x: auto; padding: 2px 0 4px; scrollbar-width: none; }
+#planChips button { flex: none; border-radius: 999px; display: flex; align-items: center; gap: 6px; }
+#planChips button.on { background: var(--brand); color: #fff; border-color: transparent; }
+#planChips button.add { border-style: dashed; background: #fff; }
+#planChips i { width: 14px; height: 14px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.4); }
+#planbar .hint { font-size: 13px; color: var(--ink2); line-height: 1.3; }
+#planbar button.danger { color: var(--bad); background: #fff; border-color: var(--bad); }
+#planInfo { font-weight: 600; color: var(--ink) !important; }
 #planInfo { font-size: 13px; color: var(--ink2); }
 
 #crosshair { position: fixed; left: 50%; top: calc((100% - var(--bar) - var(--sab)) / 2); width: 30px; height: 30px; margin: -15px 0 0 -15px; z-index: 900; pointer-events: none;
@@ -131,3 +141,14 @@ table.preview td, table.preview th { border: 1px solid var(--line); padding: 3px
 .badge.done { background: #d9f7e2; border-color: #0b5d23; }
 .badge.skipped { background: #e0e0e0; }
 #map.lowzoom .spt:not(.tgt) span { display: none; }
+.vtx.area { border-color: #e65100; }
+.mid { width: 20px; height: 20px; border-radius: 50%; background: rgba(255,255,255,.9); border: 2px solid #e65100; color: #e65100; font: 700 15px/16px system-ui, sans-serif; text-align: center; box-shadow: 0 0 3px rgba(0,0,0,.6); cursor: pointer; }
+.area-label { background: rgba(16,38,43,.75); color: #fff; border: 0; box-shadow: none; font-weight: 700; padding: 1px 6px; }
+.area-label::before { display: none; }
+#planbar button, #planbar select, #planbar input[type=number] { min-height: 40px; }
+#planbar .links { gap: 2px; }
+#planbar .links button { border: 0; background: none; padding: 0 8px; text-decoration: underline; font-size: 14px; }
+#planbar .links button.danger { border: 0; }
+#planbar label { font-size: 13px; }
+#planbar input[type=number] { width: 3.8em; }
+#map.lowzoom .spt { transform: scale(.65); }

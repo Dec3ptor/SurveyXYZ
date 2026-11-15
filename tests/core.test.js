@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { RouteFollower, samplePoints, pointInPolygon } from '../js/geo.js';
+import { RouteFollower, samplePoints, pointInPolygon, buildPlan, insideRing } from '../js/geo.js';
 import { hotspotDiameter } from '../js/modes.js';
 import { samplesCSV, samplesGeoJSON, obsCSV } from '../js/exporters.js';
 import { haversine, bearing, LocalFrame, generateTransects, nearestOnRoute, polygonArea, pathLength, Coverage, angDiff } from '../js/geo.js';
@@ -181,7 +181,7 @@ test('merge interpolates, applies clock offset, respects gaps', () => {
 });
 
 test('exports and plan import round-trip', async () => {
-  const survey = { name: 'Test & <site>', created: 1e12, plan: { boundary: [[1, 2], [1, 3], [2, 3]], route: [[1, 2], [1.5, 2.5]] } };
+  const survey = { name: 'Test & <site>', created: 1e12, plan: { areas: [{ id: 'a', name: 'Site', ring: [[1, 2], [1, 3], [2, 3]], fill: 'points', pattern: 'square', spacing: 10 }], route: [[1, 2], [1.5, 2.5]] } };
   const pts = [{ t: 1e12, lat: 1, lon: 2, rlat: 1.00001, rlon: 2, acc: 4.2, seg: 1, src: 'gps', mov: 1 }, { t: 1e12 + 1000, lat: 1.1, lon: 2.1, rlat: 1.1, rlon: 2.1, acc: 5, seg: 1, src: 'gps', mov: 1 }];
   const csv = parseCSV(trackCSV(pts));
   assert.equal(csv.length, 3);
@@ -192,11 +192,13 @@ test('exports and plan import round-trip', async () => {
   assert.ok(x.includes('Test &amp; &lt;site&gt;') && x.includes('<trkpt lat="1.1" lon="2.1">'));
   assert.equal(obsGeoJSON(obs).features[0].properties.photo, 'photos/obs001_1.jpg');
   const back = parsePlanFile(JSON.stringify(planGeoJSON(survey)));
-  assert.deepEqual(back.boundary, survey.plan.boundary);
+  assert.deepEqual(back.areas[0].ring, survey.plan.areas[0].ring);
+  assert.equal(back.areas[0].name, 'Site');
+  assert.equal(back.areas[0].spacing, 10);
   assert.deepEqual(back.route, survey.plan.route);
   assert.equal(parsePlanFile(x).route.length, 2); // planned route preferred over track
   const kml = '<kml><Placemark><Polygon><outerBoundaryIs><LinearRing><coordinates>2,1,0 3,1,0 3,2,0 2,1,0</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></kml>';
-  assert.deepEqual(parsePlanFile(kml).boundary, [[1, 2], [1, 3], [2, 3]]);
+  assert.deepEqual(parsePlanFile(kml).areas[0].ring, [[1, 2], [1, 3], [2, 3]]);
   const zip = await makeZip([{ name: 'a.txt', data: 'hello' }, { name: 'b/c.bin', data: new Uint8Array([1, 2, 3]) }]);
   const buf = new Uint8Array(await zip.arrayBuffer());
   assert.equal(buf[0], 0x50); assert.equal(buf[1], 0x4b);
@@ -252,7 +254,7 @@ test('sampling patterns', () => {
 });
 
 test('sample register export and point import', () => {
-  const survey = { name: 'Site', created: 1e12, plan: { boundary: [], route: [], points: [{ id: 'S01', lat: 1, lon: 2, kind: 'grid', status: 'done' }] } };
+  const survey = { name: 'Site', created: 1e12, plan: { areas: [], route: [], points: [{ id: 'S01', lat: 1, lon: 2, kind: 'grid', status: 'done' }] } };
   const obs = [
     { kind: 'sample', num: 1, t: 1e12, lat: 1.00001, lon: 2, acc: 3, pointId: 'S01', note: 'ok', photoIds: [], data: { sampleId: 'S01_0.1', type: 'Primary', depthFrom: 0.1, depthTo: 0.2, soil: ['Clay', 'Silt'], analytes: ['TPH', 'PAH'] } },
     { num: 2, t: 1e12, lat: 1, lon: 2, category: 'Odour', note: '', photoIds: [] },
@@ -266,9 +268,32 @@ test('sample register export and point import', () => {
   assert.equal(samplesGeoJSON(survey, obs).features[0].properties.analytes, 'TPH; PAH');
   assert.equal(parseCSV(obsCSV(obs)).length, 2); // the note only
   const back = parsePlanFile(JSON.stringify(planGeoJSON(survey)));
-  assert.deepEqual(back.points, [{ lat: 1, lon: 2, id: 'S01' }]);
+  assert.deepEqual(back.points, [{ lat: 1, lon: 2, id: 'S01', type: 'grid' }]);
   const g = parsePlanFile('<gpx><wpt lat="1" lon="2"><name>BH1</name></wpt></gpx>');
   assert.deepEqual(g.points, [{ lat: 1, lon: 2, id: 'BH1' }]);
   const k = parsePlanFile('<kml><Placemark><name>TP3</name><Point><coordinates>2,1,0</coordinates></Point></Placemark></kml>');
   assert.deepEqual(k.points, [{ lat: 1, lon: 2, id: 'TP3' }]);
+});
+
+test('plan areas: focus area replaces the site grid inside it, exclusion leaves a hole', () => {
+  const ring = (x0, y0, x1, y1) => [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(([x, y]) => F.toLL(x, y));
+  const site = { id: 'site', ring: ring(0, 0, 100, 100), fill: 'points', pattern: 'square', spacing: 20, bearing: 0 };
+  const focus = { id: 'focus', ring: ring(0, 0, 40, 40), fill: 'points', pattern: 'square', spacing: 5, bearing: 0 };
+  const shed = { id: 'shed', ring: ring(60, 60, 100, 100), fill: 'none' };
+  const alone = buildPlan([site]);
+  assert.equal(alone.points.length, 25);
+  const plan = buildPlan([site, focus, shed]);
+  assert.equal(plan.counts.focus, 64); // 40 x 40 at 5 m
+  assert.equal(plan.counts.site, 25 - 4 - 4); // four site points fall in each inner area
+  for (const p of plan.points.filter((q) => q.area === 'site')) {
+    assert.ok(!insideRing(focus.ring, p.lat, p.lon) && !insideRing(shed.ring, p.lat, p.lon));
+  }
+  const rnd = { id: 'r', ring: ring(0, 0, 50, 50), fill: 'points', pattern: 'random', count: 12, seed: 5 };
+  const a = buildPlan([rnd]).points, b = buildPlan([rnd]).points;
+  assert.equal(a.length, 12);
+  assert.deepEqual(a, b); // same seed, same layout
+  assert.notDeepEqual(a, buildPlan([{ ...rnd, seed: 6 }]).points);
+  const walk = buildPlan([{ id: 'w1', ring: ring(0, 0, 100, 50), fill: 'route', spacing: 10, bearing: 0 }, { id: 'w2', ring: ring(200, 0, 220, 50), fill: 'route', spacing: 5, bearing: 0 }]);
+  assert.equal(walk.route.length, 20 + 8);
+  assert.equal(walk.points.length, 0);
 });

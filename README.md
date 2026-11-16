@@ -74,8 +74,23 @@ replace chain-of-custody paperwork, though the register has what that paperwork 
 | Observe | **Mark** / **Note** | One-tap numbered pin, or a note with photos, category, manual reading and text. Position is taken when you press the button. |
 | Offline map | **Menu → Settings** | Frame the site and **Save this map area** while you still have signal. |
 
-Keep the app open with the screen on while recording. Browsers do not give web apps GPS in the
-background or with the phone locked; the app holds a screen wake lock where the browser allows it.
+### Phone in a pocket
+
+Browsers (iPhone and Android alike) give a web app **no GPS once the phone is locked or the app is
+in the background**. Nothing a web page does can change that; only a native app can log with the
+screen off. So:
+
+- While recording, tap **Pocket**. The screen goes black and ignores touches but stays awake, so
+  GPS keeps logging. Guidance is **spoken**: off path and which way to steer, turns coming up,
+  arrival at a sampling point, route finished. Hold the unlock button for 1.5 s to come back.
+- Do not press the side button. If the phone is locked anyway, on return the app says how long
+  nothing was recorded, breaks the track at that point, restarts GPS, and lists the gap in the
+  export README.
+- If the app says it cannot keep the screen on (older iOS, or an older iOS Home Screen install),
+  set Settings → Display & Brightness → Auto-Lock → Never for the survey, or open the app in Safari.
+- For a fully locked phone, record with a native GPS logger app at the same time and add its file
+  with **Menu → Import a GPS track (GPX)**. Notes, coverage and the readings merge then use it.
+  There is no live guidance from an imported track.
 
 ## How the position filter works
 

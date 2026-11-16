@@ -199,12 +199,13 @@ export function packageReadme(survey, points, obs) {
   return `SurveyXYZ export: ${survey.name}
 Exported: ${localStamp(Date.now())} (device local time)
 Coordinates: WGS84 (EPSG:4326), decimal degrees. Times: UTC unless the column says local.
-Instrument clock offset recorded in the field: ${survey.clockOffsetS ?? 'not set'} s (add to instrument time to get true time)
+${(survey.gaps || []).length ? 'Gaps while the phone was locked or the app was in the background (nothing recorded):\n' + survey.gaps.map((g) => `  ${localStamp(g.from)} to ${localStamp(g.to).slice(11)}`).join('\n') + '\n' : ''}Instrument clock offset recorded in the field: ${survey.clockOffsetS ?? 'not set'} s (add to instrument time to get true time)
 
 track.csv              one row per GPS fix (${points.length} rows). latitude/longitude are the
                        filtered position; raw_latitude/raw_longitude are exactly what the GPS
                        reported. source: gps = fix used, rej = fix distrusted (see reject_reason),
-                       dr = dead-reckoned from steps + compass while GPS was absent.
+                       dr = dead-reckoned from steps + compass while GPS was absent,
+                       import = from a GPX track added afterwards.
 track_line.geojson     the walked path as a line (one part per recording segment)
 track_points.geojson   every fix as a point with attributes
 observations.geojson   notes / marks / manual readings (${notesOnly(obs).length}); 'photo' is a relative path
@@ -295,4 +296,18 @@ export function parsePlanFile(text) {
   res.points = (res.points || []).filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon));
   if (!res.areas.length && !res.route && !res.points.length) throw new Error('No polygon, line or points found in file');
   return res;
+}
+
+/** Timed track points from a GPX file: [{t, lat, lon, alt, seg}], sorted by time. */
+export function parseGpxTrack(text) {
+  const out = [];
+  [...text.matchAll(/<trkseg[\s\S]*?<\/trkseg>/gi)].forEach((sm, seg) => {
+    for (const m of sm[0].matchAll(/<trkpt\b([^>]*)>([\s\S]*?)<\/trkpt>/gi)) {
+      const lat = +(m[1].match(/lat\s*=\s*["']([^"']+)/i) || [])[1], lon = +(m[1].match(/lon\s*=\s*["']([^"']+)/i) || [])[1];
+      const t = Date.parse((m[2].match(/<time>([^<]+)<\/time>/i) || [])[1]);
+      const ele = parseFloat((m[2].match(/<ele>([^<]+)<\/ele>/i) || [])[1]);
+      if (Number.isFinite(lat) && Number.isFinite(lon) && Number.isFinite(t)) out.push({ t, lat, lon, alt: Number.isFinite(ele) ? ele : null, seg });
+    }
+  });
+  return out.sort((a, b) => a.t - b.t);
 }

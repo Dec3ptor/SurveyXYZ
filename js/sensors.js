@@ -33,6 +33,13 @@ export class Sensors {
     );
   }
 
+  /** Browsers can silently drop a location watch while the page is hidden; start a fresh one. */
+  restartGps() {
+    if (this.watchId != null) navigator.geolocation.clearWatch(this.watchId);
+    this.watchId = null;
+    this.startGps();
+  }
+
   handlePosition(pos) {
     const c = pos.coords;
     // Some browsers hand out odd timestamps; fall back to the device clock.

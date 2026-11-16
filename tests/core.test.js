@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { RouteFollower, samplePoints, pointInPolygon, buildPlan, insideRing } from '../js/geo.js';
 import { hotspotDiameter } from '../js/modes.js';
-import { samplesCSV, samplesGeoJSON, obsCSV } from '../js/exporters.js';
+import { samplesCSV, samplesGeoJSON, obsCSV, parseGpxTrack, packageReadme } from '../js/exporters.js';
 import { haversine, bearing, LocalFrame, generateTransects, nearestOnRoute, polygonArea, pathLength, Coverage, angDiff } from '../js/geo.js';
 import { FusionFilter, StepDetector } from '../js/fusion.js';
 import { parseCSV, parseInstrumentTime, detectDateOrder, positionAt, mergeReadings, mergedTable, guessTimeColumns, detectDelimiter } from '../js/merge.js';
@@ -296,4 +296,15 @@ test('plan areas: focus area replaces the site grid inside it, exclusion leaves 
   const walk = buildPlan([{ id: 'w1', ring: ring(0, 0, 100, 50), fill: 'route', spacing: 10, bearing: 0 }, { id: 'w2', ring: ring(200, 0, 220, 50), fill: 'route', spacing: 5, bearing: 0 }]);
   assert.equal(walk.route.length, 20 + 8);
   assert.equal(walk.points.length, 0);
+});
+
+test('gpx track import and gap note', () => {
+  const survey = { name: 'S', created: 1e12, plan: {}, gaps: [{ from: 1e12, to: 1e12 + 60000 }] };
+  const pts = [{ t: 1e12, lat: 1, lon: 2, alt: 5, seg: 1, src: 'gps' }, { t: 1e12 + 5000, lat: 1.1, lon: 2.1, seg: 1, src: 'gps' }];
+  const back = parseGpxTrack(gpx(survey, pts, []));
+  assert.equal(back.length, 2);
+  assert.deepEqual(back[0], { t: 1e12, lat: 1, lon: 2, alt: 5, seg: 0 });
+  assert.equal(back[1].alt, null);
+  assert.ok(packageReadme(survey, pts, []).includes('nothing recorded'));
+  assert.equal(parseGpxTrack('<gpx><trk><trkseg><trkpt lat="1" lon="2"></trkpt></trkseg></trk></gpx>').length, 0); // no times
 });

@@ -14,7 +14,7 @@ export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&a
 
 // ---------- settings ----------
 const DEFAULTS = {
-  filterMode: 'smart', maxAcc: 25, tol: 3, spacing: 10, sound: true, vibrate: true, showRaw: false,
+  filterMode: 'smart', maxAcc: 25, tol: 3, spacing: 10, sound: true, vibrate: true, speak: true, showRaw: false,
   base: 'Satellite', arrive: 3, analytes: DEFAULT_ANALYTES, mode: 'ism',
 };
 export const settings = { ...DEFAULTS, ...JSON.parse(localStorage.getItem('sxyz.settings') || '{}') };
@@ -130,6 +130,16 @@ function beep() {
     o.connect(g); g.connect(beep.ctx.destination);
     o.start(); o.stop(beep.ctx.currentTime + 0.18);
   } catch { /* no audio */ }
+}
+/** Spoken guidance, so the phone can stay in a pocket. iOS only speaks after a tap has started it once (Record does). */
+function speak(text) {
+  if (!settings.speak || !('speechSynthesis' in window)) return;
+  try {
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.05;
+    speechSynthesis.speak(u);
+  } catch { /* no speech */ }
 }
 export const fmtDist = (m) => (m >= 1000 ? (m / 1000).toFixed(2) + ' km' : Math.round(m) + ' m');
 const fmtDur = (ms) => {
@@ -368,6 +378,7 @@ function guidePoints(est) {
   $('guideSub').textContent = `${here ? 'You are here — tap Sample' : `${cardinal(b)} (${Math.round(b)}°)`} · GPS ±${Math.round(S.fix?.acc ?? est.sigma ?? 0)} m · ${done} of ${pts.length} done`;
   if (here && guidePoints.arrived !== t.id) {
     guidePoints.arrived = t.id;
+    if (S.recording) speak(`Arrived at ${t.id.split('').join(' ')}`);
     if (settings.vibrate && navigator.vibrate) navigator.vibrate(300);
     if (settings.sound) beep();
   }
@@ -430,8 +441,24 @@ function guide(est) {
       S.lastAlert = Date.now();
       if (settings.vibrate && navigator.vibrate) navigator.vibrate([200, 100, 200]);
       if (settings.sound) beep();
+      speak(far ? `Path is ${Math.round(n.dist)} metres away` : `Off path. ${Math.max(1, Math.round(a))} metres. Steer ${n.xte > 0 ? 'left' : 'right'}`);
+      guide.wasOff = true;
     }
-  } else S.offCount = 0;
+  } else {
+    S.offCount = 0;
+    if (guide.wasOff && !off) { guide.wasOff = false; if (S.recording) speak('On path'); }
+  }
+  if (S.recording && !off) {
+    // Call the turn a few metres before it, and the finish once.
+    const xy = S.route.xy, i = n.idx;
+    if (done && guide.said !== 'done') { guide.said = 'done'; speak('Route finished'); }
+    else if (!done && n.toTurn < 6 && i < n.legs - 1 && guide.said !== i) {
+      guide.said = i;
+      const b1 = Math.atan2(xy[i + 1][0] - xy[i][0], xy[i + 1][1] - xy[i][1]), b2 = Math.atan2(xy[i + 2][0] - xy[i + 1][0], xy[i + 2][1] - xy[i + 1][1]);
+      const turn = angDiff((b2 * 180) / Math.PI, (b1 * 180) / Math.PI);
+      if (Math.abs(turn) > 20) speak(`Turn ${turn > 0 ? 'right' : 'left'} in ${Math.max(1, Math.round(n.toTurn))} metres`);
+    }
+  }
   if (S.recording && Math.abs((S.survey.progress || 0) - f.s) > 20) { S.survey.progress = f.s; saveSurvey(); }
   return n.xte;
 }
@@ -496,11 +523,14 @@ async function startRecording() {
   $('bRec').classList.add('on');
   $('bRec').lastElementChild.textContent = 'Stop';
   setFollow(true);
+  speak('Recording'); // also unlocks speech on iPhone, which needs a tap to start it
   const motion = await sensors.startMotion();
   sensors.startGps();
   const awake = await sensors.keepAwake(true);
+  S.awake = awake;
+  $('pocketBtn').hidden = false;
   if (navigator.storage?.persist) navigator.storage.persist();
-  toast(`Recording. ${awake ? 'Screen will stay on' : 'Keep the screen on'} — GPS stops if the phone locks or you switch apps.` + (motion ? '' : ' Motion sensors unavailable: using GPS-only smoothing.'), 6000);
+  toast(`Recording. ${awake ? 'The screen will stay on' : 'Set Auto-Lock to Never — this browser cannot keep the screen on'}. For a pocket, tap Pocket: do not lock the phone, GPS stops if you do.` + (motion ? '' : ' Motion sensors unavailable: using GPS-only smoothing.'), 6000);
   updateRecChip();
 }
 async function stopRecording() {
@@ -508,6 +538,7 @@ async function stopRecording() {
   $('bRec').classList.remove('on');
   $('bRec').lastElementChild.textContent = 'Record';
   sensors.keepAwake(false);
+  $('pocketBtn').hidden = true; setPocket(false);
   if (S.follower) { S.survey.progress = S.follower.s; saveSurvey(); }
   drawCovered(); updateRecChip();
 }
@@ -523,6 +554,50 @@ function updateRecChip() {
 }
 setInterval(updateRecChip, 1000);
 window.addEventListener('beforeunload', (e) => { if (S.recording) { e.preventDefault(); e.returnValue = ''; } });
+
+// ---------- pocket mode and interruptions ----------
+// A web page gets no GPS once the phone is locked or the app is in the
+// background (iOS and Android both). So for carrying the phone in a pocket the
+// screen is kept awake but blacked out and touch-locked, with spoken guidance.
+function setPocket(on) {
+  document.body.classList.toggle('pocket', on);
+  $('pocket').hidden = !on;
+  if (on) { pocketTick(); sensors.keepAwake(true).then((ok) => { S.awake = ok; pocketTick(); }); }
+}
+function pocketTick() {
+  if ($('pocket').hidden) return;
+  const g = $('guide').hidden ? '' : `${$('guideText').textContent} · ${$('dialDist').textContent} ${$('dialLabel').textContent}`;
+  $('pocketInfo').innerHTML = `<b>${esc(ex.localStamp(Date.now()).slice(11, 16))}</b><br>Recording ${esc(fmtDur(S.activeMs))} · ${esc(fmtDist(S.dist))}<br>${esc($('gpsChip').textContent)}<br>${esc(g)}`
+    + (S.awake ? '' : '<br><br>This browser cannot keep the screen on.<br>Set Settings → Display &amp; Brightness → Auto-Lock → Never.');
+}
+setInterval(pocketTick, 2000);
+$('pocketBtn').onclick = () => setPocket(true);
+{
+  let hold = null;
+  const btn = $('pocketUnlock');
+  const cancel = () => { clearTimeout(hold); btn.classList.remove('holding'); };
+  btn.addEventListener('pointerdown', () => { btn.classList.add('holding'); hold = setTimeout(() => { cancel(); setPocket(false); }, 1500); });
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, cancel);
+  $('pocket').addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+}
+
+// If the phone was locked or the app left while recording, GPS was not being
+// logged. Say so plainly on return, break the track there and restart location.
+let hiddenAt = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); if (S.recording && S.follower) { S.survey.progress = S.follower.s; saveSurvey(); } return; }
+  const away = hiddenAt ? Date.now() - hiddenAt : 0;
+  hiddenAt = 0;
+  sensors.restartGps();
+  if (!S.recording || away < 5000) return;
+  S.seg++; trackLine = rawLine = null;
+  (S.survey.gaps ||= []).push({ from: Date.now() - away, to: Date.now() });
+  saveSurvey();
+  const mins = away >= 90000 ? `${Math.round(away / 60000)} minutes` : `${Math.round(away / 1000)} seconds`;
+  toast(`Nothing was recorded for ${mins}: the phone was locked or the app was in the background. Recording has resumed.`, 12000);
+  beep(); speak(`Warning. Nothing was recorded for ${mins}.`);
+  sensors.keepAwake(true).then((ok) => { S.awake = ok; });
+});
 
 function setFollow(on) {
   S.follow = on;
@@ -961,14 +1036,36 @@ $('bMenu').onclick = () => {
     <button class="btn" data-a="notes">Notes &amp; marks<small>${notes} in this survey</small></button>
     <button class="btn" data-a="surveys">Surveys<small>New, switch, rename, delete, restore backup</small></button>
     <button class="btn" data-a="settings">Settings &amp; offline maps</button>
+    <button class="btn" data-a="track">Import a GPS track (GPX)<small>Add a track recorded by another app, e.g. with the phone locked</small></button>
     <button class="btn" data-a="help">How it works</button>
   </div>`);
   b.querySelector('.list').onclick = (e) => {
     const a = e.target.closest('button')?.dataset.a;
-    if (a) ({ mode: openMode, points: openPointList, samples: openSamplesList, export: openExport, merge: () => openMerge(), clock: openClock, notes: openNotesList, surveys: openSurveys, settings: openSettings, help: openHelp })[a]();
+    if (a) ({ track: importTrack, mode: openMode, points: openPointList, samples: openSamplesList, export: openExport, merge: () => openMerge(), clock: openClock, notes: openNotesList, surveys: openSurveys, settings: openSettings, help: openHelp })[a]();
   };
 };
 $('surveyBtn').onclick = () => openSurveys();
+
+/** Add a track logged by another GPS app to this survey, so notes, coverage and the readings merge can use it. */
+async function importTrack() {
+  const file = await pickFile('.gpx,application/gpx+xml,text/xml');
+  if (!file) return;
+  try {
+    const pts = ex.parseGpxTrack(await file.text());
+    if (!pts.length) throw new Error('no timed track points in that file');
+    if (S.recording) await stopRecording();
+    let seg = S.seg + 1, prev = null;
+    const rows = pts.map((p) => {
+      if (prev && (p.seg !== prev.seg || p.t - prev.t > 60000)) seg++;
+      prev = p;
+      return { surveyId: S.survey.id, seg, t: p.t, lat: p.lat, lon: p.lon, rlat: p.lat, rlon: p.lon, acc: null, alt: p.alt, spd: null, crs: null, cmp: null, mov: 1, src: 'import', why: '', xte: null };
+    });
+    await db.putMany('points', rows);
+    await loadSurvey(S.survey.id);
+    closeSheet();
+    toast(`${rows.length} track points imported (${ex.localStamp(pts[0].t).slice(0, 16)} to ${ex.localStamp(pts[pts.length - 1].t).slice(11, 16)}).`, 6000);
+  } catch (e) { toast('Import failed: ' + e.message, 6000); }
+}
 
 function openMode() {
   const b = openSheet('Survey type', `<p class="muted">The type sets how this survey is planned and guided and what the quick button records. You can change it at any time; nothing already recorded is lost.</p>
@@ -1176,6 +1273,7 @@ function openSettings() {
     <label class="field inline"><input type="checkbox" id="oRaw" ${settings.showRaw ? 'checked' : ''}>Show raw GPS trace on the map</label>
     <h3>Path guidance</h3>
     <label class="field">Off-path tolerance (metres)<input id="oTol" type="number" min="0.5" step="0.5" value="${settings.tol}"></label>
+    <label class="field inline"><input type="checkbox" id="oSpeak" ${settings.speak ? 'checked' : ''}>Speak guidance (off path, turns, arrival)</label>
     <label class="field inline"><input type="checkbox" id="oSound" ${settings.sound ? 'checked' : ''}>Beep when off path</label>
     <label class="field inline"><input type="checkbox" id="oVib" ${settings.vibrate ? 'checked' : ''}>Vibrate when off path (Android)</label>
     <label class="field">Sampling point “arrived” distance (metres)<input id="oArrive" type="number" min="0.5" step="0.5" value="${settings.arrive}"></label>
@@ -1194,7 +1292,7 @@ function openSettings() {
     const tol = settings.tol;
     Object.assign(settings, {
       filterMode: q('#oMode').value, maxAcc: num('#oAcc', 5, 25), showRaw: q('#oRaw').checked, tol: num('#oTol', 0.5, 3),
-      sound: q('#oSound').checked, vibrate: q('#oVib').checked, arrive: num('#oArrive', 0.5, 3), analytes: q('#oAnalytes').value,
+      sound: q('#oSound').checked, speak: q('#oSpeak').checked, vibrate: q('#oVib').checked, arrive: num('#oArrive', 0.5, 3), analytes: q('#oAnalytes').value,
       ['cats_' + S.survey.mode]: q('#oCats').value, ['unit_' + S.survey.mode]: q('#oUnit').value.trim(),
     });
     const prefix = q('#oPrefix').value.trim() || 'S';
@@ -1225,7 +1323,10 @@ function openHelp() {
     <h3>2 · Sync the instrument clock</h3>
     <p><b>Menu → Instrument clock sync</b> before you start. This is what makes the later merge line up.</p>
     <h3>3 · Record</h3>
-    <p>Press <b>Record</b> and walk. The route is followed in order from the green dot to the red dot. The arrow shows which way to face and walk (hold the phone flat, pointing ahead), with the distance back to the path when you are off it or to the next turn when you are on it; walked sections turn green. Tap the banner to continue from the nearest point, restart, or reverse the route. <b>Keep this app open with the screen on</b> — phones stop giving GPS to web apps when locked or in the background. Carry the phone the same way throughout (in hand or a chest pocket works best).</p>
+    <p>Press <b>Record</b> and walk. The route is followed in order from the green dot to the red dot. The arrow shows which way to face and walk (hold the phone flat, pointing ahead), with the distance back to the path when you are off it or to the next turn when you are on it; walked sections turn green. Tap the banner to continue from the nearest point, restart, or reverse the route. Carry the phone the same way throughout (in hand or a chest pocket works best).</p>
+    <h3>Phone in your pocket</h3>
+    <p>A web app gets <b>no GPS once the phone is locked</b> or you switch to another app; this is an iPhone and Android rule the app cannot get round. Instead, while recording tap <b>Pocket</b>: the screen goes black and ignores touches but stays awake, so GPS keeps logging, and guidance is spoken (off path and which way to steer, turns, arrival at a sampling point). Hold the unlock button to come back. <b>Do not press the side button.</b> If the phone does get locked, the app tells you how long was missed when you return.</p>
+    <p class="muted">For a fully locked phone, record the track with a GPS logger app and add it afterwards with Menu → Import a GPS track.</p>
     <h3>4 · Mark and note</h3>
     <p><b>Mark</b> drops a numbered pin instantly. <b>Note</b> captures the position first, then lets you add photos, a category, a reading and text. To record something you can see but not reach, pan the map and use <b>Move to map crosshair</b>.</p>
     <h3>5 · Export and merge</h3>
